@@ -1,0 +1,3439 @@
+#include "src/types/value/value_control.h"
+#include "src/types/device/device_control.h"
+#include "src/types/calendar/calendar_store.h"
+#include "src/ui/navigation/view_navigation.h"
+#include "src/network/mqtt/mqtt_handlers.h"
+#include "src/network/secure/command_channel.h"
+#include "src/network/mqtt/mqtt_packet_safety.h"
+#include "src/network/mqtt/mqtt_topics.h"
+#include "src/network/network_manager.h"
+#include "src/network/bridge/ha_bridge_config.h"
+#include "src/network/bridge/control_contract.h"
+#include "src/ui/tabs/tiles/tab_tiles_unified.h"
+#include "src/ui/screensaver/screensaver_config.h"
+#include "src/ui/popups/sensor/sensor_popup.h"
+#include "src/ui/popups/camera/camera_popup.h"
+#include "src/ui/screensaver/image_screensaver.h"
+#include "src/video/camera_geometry.h"
+#include "src/video/camera_transport.h"
+#include "src/ui/tabs/settings/tab_settings.h"
+#include "src/ui/shared/theme_schedule.h"
+#include "src/types/energy/energy_data.h"
+#include "src/tiles/config/tile_config.h"
+#include "src/tiles/runtime/tile_renderer.h"
+#include "src/core/config/config_manager.h"
+#include "src/core/config/week_start.h"
+#include "src/core/display/display_manager.h"
+#include "src/core/i18n/i18n.h"
+#include "src/network/bridge/device_entities.h"
+#include "src/core/power/power_manager.h"
+#include "src/core/power/battery_state.h"
+#include "src/core/hardware/board_hal.h"
+#include "src/core/display/lvgl_tick_service.h"
+#include "src/io/hardware_io.h"
+#include "src/network/bridge/entity_search.h"
+#include "src/network/bridge/bridge_images.h"
+#include "src/types/vacuum/vacuum_map.h"
+#include "src/web/server/web_admin.h"
+#include "src/video/local_camera/local_camera.h"
+#include "src/audio/speaker.h"
+#include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <time.h>
+#include <vector>
+
+#ifndef TAB5_HAS_ONEWIRE_DS18X20
+#define TAB5_HAS_ONEWIRE_DS18X20 0
+#endif
+
+// External temperature channels are configured by hardwareIo. Library presence
+// is not a board capability and must never enable GPIO 1/50 auto-probing.
+// Cached values for outgoing snapshots
+static float g_outside_c = 21.7f;
+static float g_inside_c = 22.4f;
+static int g_soc_pct = -1;
+static float g_external_temp_c = NAN;
+static bool g_external_temp_valid = false;
+static constexpr uint32_t kExternalTempGridRefreshMs = 5000;
+static String g_external_last_grid_payload;
+static uint32_t g_external_last_grid_ms = 0;
+static constexpr uint16_t kExternalTempHistoryHoursMax = 168;
+static constexpr uint16_t kExternalTempHistorySampleMinutes = 5;
+static constexpr uint16_t kExternalTempHistoryPoints =
+    static_cast<uint16_t>((kExternalTempHistoryHoursMax * 60U) / kExternalTempHistorySampleMinutes);
+static constexpr uint32_t kExternalTempHistorySampleMs =
+    static_cast<uint32_t>(kExternalTempHistorySampleMinutes) * 60UL * 1000UL;
+static uint8_t* g_external_history_storage = nullptr;
+static float* g_external_history_values = nullptr;
+static bool* g_external_history_valid = nullptr;
+static uint16_t g_external_history_head = 0;
+static uint16_t g_external_history_count = 0;
+static uint32_t g_external_history_last_store_ms = 0;
+static constexpr uint32_t kHistoryHaResponseTimeoutMs = 2000;
+static constexpr uint32_t kDiscreteHistoryHaResponseTimeoutMs = 8000;
+static constexpr uint8_t kHistoryPendingSlots = 8;
+static constexpr uint32_t kDynamicSlotReloadQuietMs = 3000;
+static constexpr uint32_t kDynamicSlotReloadAdminQuietMs = 5000;
+
+static volatile bool g_dynamic_slots_reload_requested = false;
+static uint32_t g_dynamic_slots_reload_due_ms = 0;
+static bool g_bridge_initial_sync_complete = false;
+
+struct PendingHistoryRequest {
+  String entity_id;
+  uint32_t requested_at_ms = 0;
+  uint16_t hours = 24;
+  uint16_t period_minutes = 5;
+  uint16_t points = 288;
+  bool active = false;
+};
+
+static PendingHistoryRequest g_pending_history[kHistoryPendingSlots];
+
+// The graph popup asks again on every range switch and every opening. An
+// answer stays valid as long as its own steps, at least a minute: a day in
+// 5-minute steps for 5 minutes, a week in hour steps for an hour (user
+// 2026-10-14: 7 days came at once within a minute, then slowly again, each
+// time a new Recorder query of a busy sensor). Replayed instead of another
+// query; the popup's head shows the current value. Payloads in PSRAM.
+struct HistoryReplayEntry {
+  String entity_id;
+  uint16_t hours = 0;
+  uint16_t period_minutes = 0;
+  uint16_t points = 0;
+  uint32_t stored_ms = 0;
+  char* payload = nullptr;
+  size_t length = 0;
+};
+static constexpr uint8_t kHistoryReplaySlots = 8;
+static constexpr uint32_t kHistoryReplayMinAgeMs = 60UL * 1000UL;
+static uint32_t history_replay_max_age_ms(uint16_t period_minutes) {
+  const uint32_t step = static_cast<uint32_t>(period_minutes) * 60UL * 1000UL;
+  return step > kHistoryReplayMinAgeMs ? step : kHistoryReplayMinAgeMs;
+}
+static constexpr size_t kHistoryReplayMaxBytes = 8UL * 1024UL;
+static HistoryReplayEntry g_history_replay[kHistoryReplaySlots];
+
+struct PendingDiscreteHistoryRequest {
+  String entity_id;
+  String kind;
+  uint32_t requested_at_ms = 0;
+  uint16_t hours = 24;
+  bool active = false;
+};
+
+static PendingDiscreteHistoryRequest g_pending_discrete_history;
+
+static String buildHaStatestreamTopic(const String& entity_id, const char* suffix);
+
+// Set by the MQTT worker when it drops an inbound message, read by the loop.
+static volatile bool g_inbound_dropped = false;
+// millis() of the last message the MQTT worker received.
+static volatile uint32_t g_last_inbound_ms = 0;
+
+bool mqttTakeInboundDropped() {
+  if (!g_inbound_dropped) return false;
+  g_inbound_dropped = false;
+  return true;
+}
+
+static void update_all_grids(const char* entity_id, const char* payload) {
+  if (!entity_id || !payload) return;
+  tiles_update_sensor_by_entity(GridType::TAB0, entity_id, payload);
+  tiles_update_sensor_by_entity(GridType::TAB1, entity_id, payload);
+  tiles_update_sensor_by_entity(GridType::TAB2, entity_id, payload);
+}
+
+static bool is_external_temp_entity(const char* entity_id) {
+  if (!entity_id || !*entity_id) return false;
+  // New firmware routes explicitly configured channels through hardwareIo.
+  return false;
+}
+
+static bool is_internal_tab5_entity(const char* entity_id) {
+  if (!entity_id || !*entity_id) return false;
+  String normalized(entity_id);
+  normalized.trim();
+  normalized.toLowerCase();
+
+  if (normalized.equalsIgnoreCase(kEntityDisplayBrightness)) return true;
+  if (normalized.equalsIgnoreCase(kEntityScreensaverBrightness)) return true;
+  if (normalized.equalsIgnoreCase(kEntityDisplayRotate)) return true;
+  if (normalized.equalsIgnoreCase(kEntityDisplaySleep)) return true;
+
+  return false;
+}
+
+static bool has_valid_local_time_for_history() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 0)) return false;
+
+  const int year = timeinfo.tm_year + 1900;
+  const int month = timeinfo.tm_mon + 1;
+  const int day = timeinfo.tm_mday;
+  const int hour = timeinfo.tm_hour;
+  const int minute = timeinfo.tm_min;
+
+  return (year >= 2024 && year <= 2100) &&
+         (month >= 1 && month <= 12) &&
+         (day >= 1 && day <= 31) &&
+         (hour >= 0 && hour < 24) &&
+         (minute >= 0 && minute < 60);
+}
+
+static bool ensure_external_temp_history_storage() {
+  if (g_external_history_storage) return true;
+
+  constexpr size_t kValuesBytes =
+      sizeof(float) * static_cast<size_t>(kExternalTempHistoryPoints);
+  constexpr size_t kValidBytes =
+      sizeof(bool) * static_cast<size_t>(kExternalTempHistoryPoints);
+  g_external_history_storage = static_cast<uint8_t*>(heap_caps_calloc(
+      1, kValuesBytes + kValidBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!g_external_history_storage) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      Serial.printf("[History] No PSRAM for local temperature history (%u bytes)\n",
+                    static_cast<unsigned>(kValuesBytes + kValidBytes));
+    }
+    return false;
+  }
+
+  g_external_history_values =
+      reinterpret_cast<float*>(g_external_history_storage);
+  g_external_history_valid =
+      reinterpret_cast<bool*>(g_external_history_storage + kValuesBytes);
+  return true;
+}
+
+static void push_external_temp_history(float value, bool valid) {
+  if (!ensure_external_temp_history_storage()) return;
+  g_external_history_values[g_external_history_head] = value;
+  g_external_history_valid[g_external_history_head] = valid;
+  g_external_history_head = static_cast<uint16_t>((g_external_history_head + 1) % kExternalTempHistoryPoints);
+  if (g_external_history_count < kExternalTempHistoryPoints) {
+    ++g_external_history_count;
+  }
+}
+
+static void store_external_temp_history(uint32_t now_ms) {
+  if (!has_valid_local_time_for_history()) {
+    // Wait for valid time so history is not filled with pre-NTP boot samples.
+    g_external_history_last_store_ms = 0;
+    return;
+  }
+
+  if (g_external_history_last_store_ms == 0) {
+    if (!g_external_temp_valid || std::isnan(g_external_temp_c) || std::isinf(g_external_temp_c)) {
+      return;
+    }
+    g_external_history_last_store_ms = now_ms - kExternalTempHistorySampleMs;
+  }
+
+  if ((int32_t)(now_ms - g_external_history_last_store_ms) < static_cast<int32_t>(kExternalTempHistorySampleMs)) {
+    return;
+  }
+  g_external_history_last_store_ms = now_ms;
+
+  if (g_external_temp_valid && !std::isnan(g_external_temp_c) && !std::isinf(g_external_temp_c)) {
+    push_external_temp_history(g_external_temp_c, true);
+  } else if (g_external_history_count > 0) {
+    push_external_temp_history(0.0f, false);
+  }
+}
+
+static String build_external_temp_history_payload(const char* entity_id,
+                                                  uint16_t hours,
+                                                  uint16_t period_minutes,
+                                                  uint16_t points) {
+  if (hours == 0) hours = 24;
+  if (hours > kExternalTempHistoryHoursMax) hours = kExternalTempHistoryHoursMax;
+  if (period_minutes == 0) period_minutes = kExternalTempHistorySampleMinutes;
+  if (points == 0) {
+    points = static_cast<uint16_t>((static_cast<uint32_t>(hours) * 60U) / period_minutes);
+  }
+  if (points == 0) points = 1;
+
+  // The samples (one per kExternalTempHistorySampleMinutes) the buckets
+  // cover by time: a bucket shorter than a sample (the popup's 6H asks for
+  // minutes) shares its sample with its neighbours instead of taking one of
+  // its own, which drew 30 hours as six.
+  const uint32_t requested_base_points =
+      (static_cast<uint32_t>(points) * period_minutes + kExternalTempHistorySampleMinutes - 1U) /
+      kExternalTempHistorySampleMinutes;
+  const uint16_t clamped_base_points = static_cast<uint16_t>(
+      requested_base_points > kExternalTempHistoryPoints ? kExternalTempHistoryPoints : requested_base_points);
+  const uint16_t available_base_points =
+      (g_external_history_count > clamped_base_points) ? clamped_base_points : g_external_history_count;
+  const uint16_t missing_base_points = static_cast<uint16_t>(clamped_base_points - available_base_points);
+  const uint16_t history_start = static_cast<uint16_t>(
+      (g_external_history_head + kExternalTempHistoryPoints - available_base_points) % kExternalTempHistoryPoints);
+
+  String payload;
+  payload.reserve(12288);
+  payload = "{\"entity_id\":\"";
+  payload += entity_id ? entity_id : kEntityExternalTemperature;
+  payload += "\",\"unit\":\"C\",\"current\":\"";
+
+  char current_buf[24];
+  const bool has_current_value = g_external_temp_valid && !std::isnan(g_external_temp_c) && !std::isinf(g_external_temp_c);
+  if (has_current_value) {
+    dtostrf(g_external_temp_c, 0, 1, current_buf);
+    payload += current_buf;
+  } else {
+    payload += "unavailable";
+  }
+  payload += "\",\"hours\":";
+  payload += String(hours);
+  payload += ",\"period_minutes\":";
+  payload += String(period_minutes);
+  payload += ",\"stat\":\"mean\",\"values\":[";
+
+  bool first = true;
+
+  for (uint16_t bucket = 0; bucket < points; ++bucket) {
+    if (!first) payload += ",";
+
+    float sum = 0.0f;
+    uint16_t valid_count = 0;
+    const uint32_t first_sample =
+        static_cast<uint32_t>(bucket) * period_minutes / kExternalTempHistorySampleMinutes;
+    const uint32_t end_sample = std::max<uint32_t>(
+        first_sample + 1U,
+        ((static_cast<uint32_t>(bucket) + 1U) * period_minutes + kExternalTempHistorySampleMinutes - 1U) /
+            kExternalTempHistorySampleMinutes);
+    for (uint32_t virtual_index = first_sample; virtual_index < end_sample; ++virtual_index) {
+      if (virtual_index < missing_base_points) continue;
+
+      const uint32_t local_offset = virtual_index - missing_base_points;
+      if (local_offset >= available_base_points) continue;
+
+      const uint16_t idx = static_cast<uint16_t>((history_start + local_offset) % kExternalTempHistoryPoints);
+      if (!g_external_history_valid[idx] || std::isnan(g_external_history_values[idx]) ||
+          std::isinf(g_external_history_values[idx])) {
+        continue;
+      }
+      sum += g_external_history_values[idx];
+      ++valid_count;
+    }
+
+    if (valid_count == 0) {
+      payload += "null";
+    } else {
+      dtostrf(sum / valid_count, 0, 1, current_buf);
+      payload += current_buf;
+    }
+    first = false;
+  }
+
+  payload += "]}";
+  return payload;
+}
+
+static String build_empty_history_payload(const char* entity_id,
+                                          uint16_t hours = 0,
+                                          uint16_t period_minutes = 0,
+                                          uint16_t points = 0) {
+  String payload;
+  payload.reserve(160);
+  payload = "{\"entity_id\":\"";
+  payload += entity_id ? entity_id : "";
+  payload += "\"";
+  if (hours) {
+    payload += ",\"hours\":";
+    payload += String(hours);
+  }
+  if (period_minutes) {
+    payload += ",\"period_minutes\":";
+    payload += String(period_minutes);
+  }
+  if (points) {
+    payload += ",\"points\":";
+    payload += String(points);
+  }
+  payload += ",\"values\":[]}";
+  return payload;
+}
+
+static String build_discrete_history_unavailable_payload(
+    const char* kind, const char* entity_id, uint16_t hours,
+    const char* error) {
+  String payload;
+  payload.reserve(192);
+  payload = "{\"version\":1,\"kind\":\"";
+  payload += kind ? kind : "state";
+  payload += "\",\"entity_id\":\"";
+  payload += entity_id ? entity_id : "";
+  payload += "\",\"hours\":";
+  payload += String(hours);
+  payload += ",\"history_available\":false,\"error\":\"";
+  payload += error ? error : "unavailable";
+  payload += "\"}";
+  return payload;
+}
+
+static bool extract_json_string_field(const char* json, const char* key, String& out) {
+  out = "";
+  if (!json || !*json || !key || !*key) return false;
+
+  String pattern = "\"";
+  pattern += key;
+  pattern += "\"";
+
+  const char* found = strstr(json, pattern.c_str());
+  if (!found) return false;
+
+  const char* colon = strchr(found + pattern.length(), ':');
+  if (!colon) return false;
+
+  const char* q1 = strchr(colon + 1, '\"');
+  if (!q1) return false;
+
+  const char* q2 = strchr(q1 + 1, '\"');
+  if (!q2 || q2 <= q1 + 1) return false;
+
+  out = String(q1 + 1);
+  out.remove(static_cast<unsigned int>(q2 - (q1 + 1)));
+  out.trim();
+  return out.length() > 0;
+}
+
+static bool extract_json_uint16_field(const char* json, const char* key,
+                                      uint16_t& out) {
+  if (!json || !*json || !key || !*key) return false;
+  String pattern = "\"";
+  pattern += key;
+  pattern += "\"";
+  const char* found = strstr(json, pattern.c_str());
+  if (!found) return false;
+  const char* colon = strchr(found + pattern.length(), ':');
+  if (!colon) return false;
+  const char* value = colon + 1;
+  while (*value == ' ' || *value == '\t' || *value == '\r' ||
+         *value == '\n') {
+    ++value;
+  }
+  if (*value < '0' || *value > '9') return false;
+  char* end = nullptr;
+  const unsigned long parsed = strtoul(value, &end, 10);
+  if (!end || end == value || parsed > 0xFFFFUL) return false;
+  out = static_cast<uint16_t>(parsed);
+  return true;
+}
+
+static const PendingHistoryRequest* find_pending_history_request(const char* entity_id) {
+  if (!entity_id || !*entity_id) return nullptr;
+  for (uint8_t i = 0; i < kHistoryPendingSlots; ++i) {
+    if (g_pending_history[i].active &&
+        g_pending_history[i].entity_id.equalsIgnoreCase(entity_id)) {
+      return &g_pending_history[i];
+    }
+  }
+  return nullptr;
+}
+
+static void store_history_replay(const PendingHistoryRequest& request,
+                                 const char* payload, size_t length) {
+  if (!payload || length == 0 || length > kHistoryReplayMaxBytes) return;
+  HistoryReplayEntry* slot = nullptr;
+  for (auto& entry : g_history_replay) {
+    if (entry.payload && entry.entity_id.equalsIgnoreCase(request.entity_id) &&
+        entry.hours == request.hours &&
+        entry.period_minutes == request.period_minutes &&
+        entry.points == request.points) {
+      slot = &entry;
+      break;
+    }
+  }
+  if (!slot) {
+    for (auto& entry : g_history_replay) {
+      if (!entry.payload) { slot = &entry; break; }
+      if (!slot || entry.stored_ms < slot->stored_ms) slot = &entry;
+    }
+  }
+  char* copy = static_cast<char*>(
+      heap_caps_malloc(length + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!copy) return;
+  memcpy(copy, payload, length);
+  copy[length] = '\0';
+  if (slot->payload) heap_caps_free(slot->payload);
+  slot->entity_id = request.entity_id;
+  slot->hours = request.hours;
+  slot->period_minutes = request.period_minutes;
+  slot->points = request.points;
+  slot->stored_ms = millis();
+  slot->payload = copy;
+  slot->length = length;
+}
+
+// The stored answer for the entity and range while it is fresh, else null.
+static const HistoryReplayEntry* fresh_history_replay(const char* entity_id, uint16_t hours,
+                                                      uint16_t period_minutes, uint16_t points) {
+  const uint32_t now = millis();
+  for (const auto& entry : g_history_replay) {
+    if (!entry.payload || !entry.entity_id.equalsIgnoreCase(entity_id) ||
+        entry.hours != hours || entry.period_minutes != period_minutes ||
+        entry.points != points) {
+      continue;
+    }
+    return now - entry.stored_ms < history_replay_max_age_ms(entry.period_minutes) ? &entry : nullptr;
+  }
+  return nullptr;
+}
+
+static bool replay_history_response(const char* entity_id, uint16_t hours,
+                                    uint16_t period_minutes, uint16_t points) {
+  const HistoryReplayEntry* entry = fresh_history_replay(entity_id, hours, period_minutes, points);
+  if (!entry) return false;
+  Serial.printf("[History] Reusing answer for %s (%lu s old)\n", entity_id,
+                static_cast<unsigned long>((millis() - entry->stored_ms) / 1000));
+  queue_sensor_popup_history(nullptr, entry->payload, entry->length);
+  queue_tile_graph_history(nullptr, entry->payload, entry->length);
+  return true;
+}
+
+// The same range for the entity was asked and has no answer yet (a pending
+// entry ends with its answer or after kHistoryHaResponseTimeoutMs).
+static bool history_request_on_its_way(const char* entity_id, uint16_t hours,
+                                       uint16_t period_minutes, uint16_t points) {
+  const PendingHistoryRequest* request = find_pending_history_request(entity_id);
+  return request && request->hours == hours && request->period_minutes == period_minutes &&
+         request->points == points;
+}
+
+static void clear_pending_history_request(const char* entity_id) {
+  if (!entity_id || !*entity_id) return;
+  for (uint8_t i = 0; i < kHistoryPendingSlots; ++i) {
+    if (!g_pending_history[i].active) continue;
+    if (g_pending_history[i].entity_id.equalsIgnoreCase(entity_id)) {
+      g_pending_history[i].active = false;
+      g_pending_history[i].entity_id = "";
+      g_pending_history[i].requested_at_ms = 0;
+      g_pending_history[i].hours = 24;
+      g_pending_history[i].period_minutes = 5;
+      g_pending_history[i].points = 288;
+    }
+  }
+}
+
+static void clear_pending_discrete_history_request(
+    const char* entity_id, const char* response_kind,
+    uint16_t response_hours = 0) {
+  if (!entity_id || !*entity_id || !response_kind || !*response_kind ||
+      !g_pending_discrete_history.active) {
+    return;
+  }
+  if (!g_pending_discrete_history.entity_id.equalsIgnoreCase(entity_id) ||
+      !g_pending_discrete_history.kind.equalsIgnoreCase(response_kind)) {
+    return;
+  }
+  if (response_hours != 0 &&
+      response_hours != g_pending_discrete_history.hours) {
+    return;
+  }
+  g_pending_discrete_history = {};
+}
+
+static void mark_pending_discrete_history_request(const char* entity_id,
+                                                  const char* kind,
+                                                  uint16_t hours) {
+  if (!entity_id || !*entity_id || !kind || !*kind) return;
+  g_pending_discrete_history.entity_id = entity_id;
+  g_pending_discrete_history.kind = kind;
+  g_pending_discrete_history.requested_at_ms = millis();
+  g_pending_discrete_history.hours = hours;
+  g_pending_discrete_history.active = true;
+}
+
+static void queue_discrete_history_unavailable(const char* entity_id,
+                                               const char* kind,
+                                               uint16_t hours,
+                                               const char* error) {
+  if (!entity_id || !*entity_id) return;
+  const String payload = build_discrete_history_unavailable_payload(
+      kind, entity_id, hours, error);
+  queue_sensor_popup_history(entity_id, payload.c_str(), payload.length());
+}
+
+static void mark_pending_history_request(const char* entity_id,
+                                         uint32_t now_ms,
+                                         uint16_t hours,
+                                         uint16_t period_minutes,
+                                         uint16_t points) {
+  if (!entity_id || !*entity_id) return;
+
+  int free_idx = -1;
+  int oldest_idx = -1;
+  uint32_t oldest_ms = 0xFFFFFFFFu;
+
+  for (uint8_t i = 0; i < kHistoryPendingSlots; ++i) {
+    if (g_pending_history[i].active) {
+      if (g_pending_history[i].entity_id.equalsIgnoreCase(entity_id)) {
+        g_pending_history[i].requested_at_ms = now_ms;
+        g_pending_history[i].hours = hours;
+        g_pending_history[i].period_minutes = period_minutes;
+        g_pending_history[i].points = points;
+        return;
+      }
+      if (g_pending_history[i].requested_at_ms < oldest_ms) {
+        oldest_ms = g_pending_history[i].requested_at_ms;
+        oldest_idx = i;
+      }
+    } else if (free_idx < 0) {
+      free_idx = i;
+    }
+  }
+
+  int idx = (free_idx >= 0) ? free_idx : oldest_idx;
+  if (idx < 0) return;
+
+  g_pending_history[idx].active = true;
+  g_pending_history[idx].entity_id = entity_id;
+  g_pending_history[idx].requested_at_ms = now_ms;
+  g_pending_history[idx].hours = hours;
+  g_pending_history[idx].period_minutes = period_minutes;
+  g_pending_history[idx].points = points;
+}
+
+static bool queue_history_fallback_for_entity(const char* entity_id,
+                                              bool time_valid,
+                                              const char* reason,
+                                              uint16_t hours,
+                                              uint16_t period_minutes,
+                                              uint16_t points) {
+  if (!entity_id || !*entity_id) return false;
+
+  if (is_external_temp_entity(entity_id)) {
+    if (time_valid) {
+      store_external_temp_history(millis());
+      String local_payload = build_external_temp_history_payload(entity_id, hours, period_minutes, points);
+      if (local_payload.length()) {
+        queue_sensor_popup_history(entity_id, local_payload.c_str(), local_payload.length());
+        queue_tile_graph_history(entity_id, local_payload.c_str(), local_payload.length());
+        Serial.printf("[History] %s -> local history for %s (%u points, %uh/%umin)\n",
+                      reason ? reason : "Fallback", entity_id, points, hours, period_minutes);
+      }
+    } else {
+      String empty_payload = build_empty_history_payload(entity_id, hours, period_minutes, points);
+      queue_sensor_popup_history(entity_id, empty_payload.c_str(), empty_payload.length());
+      queue_tile_graph_history(entity_id, empty_payload.c_str(), empty_payload.length());
+      Serial.printf("[History] %s -> invalid time, empty history for %s\n",
+                    reason ? reason : "Fallback", entity_id);
+    }
+    return true;
+  }
+
+  if (is_internal_tab5_entity(entity_id)) {
+    String empty_payload = build_empty_history_payload(entity_id, hours, period_minutes, points);
+    queue_sensor_popup_history(entity_id, empty_payload.c_str(), empty_payload.length());
+    queue_tile_graph_history(entity_id, empty_payload.c_str(), empty_payload.length());
+    Serial.printf("[History] %s -> internal history for %s is empty\n",
+                  reason ? reason : "Fallback", entity_id);
+    return true;
+  }
+
+  return false;
+}
+
+static void service_pending_history_fallback() {
+  const uint32_t now_ms = millis();
+  const bool time_valid = has_valid_local_time_for_history();
+
+  for (uint8_t i = 0; i < kHistoryPendingSlots; ++i) {
+    if (!g_pending_history[i].active) continue;
+    if ((int32_t)(now_ms - g_pending_history[i].requested_at_ms) <
+        static_cast<int32_t>(kHistoryHaResponseTimeoutMs)) {
+      continue;
+    }
+
+    String entity = g_pending_history[i].entity_id;
+    const uint16_t hours = g_pending_history[i].hours;
+    const uint16_t period_minutes = g_pending_history[i].period_minutes;
+    const uint16_t points = g_pending_history[i].points;
+    g_pending_history[i].active = false;
+    g_pending_history[i].entity_id = "";
+    g_pending_history[i].requested_at_ms = 0;
+    g_pending_history[i].hours = 24;
+    g_pending_history[i].period_minutes = 5;
+    g_pending_history[i].points = 288;
+
+    if (!entity.length()) continue;
+    const bool fallback_queued = queue_history_fallback_for_entity(
+        entity.c_str(), time_valid, "HA Timeout", hours, period_minutes, points);
+    if (!fallback_queued) {
+      Serial.printf("[History] HA timeout for %s (no local fallback)\n",
+                    entity.c_str());
+    }
+  }
+
+  if (g_pending_discrete_history.active &&
+      static_cast<uint32_t>(now_ms -
+                            g_pending_discrete_history.requested_at_ms) >=
+          kDiscreteHistoryHaResponseTimeoutMs) {
+    const String entity_id = g_pending_discrete_history.entity_id;
+    const String kind = g_pending_discrete_history.kind;
+    const uint16_t hours = g_pending_discrete_history.hours;
+    g_pending_discrete_history = {};
+    queue_discrete_history_unavailable(entity_id.c_str(), kind.c_str(),
+                                       hours, "ha_timeout");
+    Serial.printf("[%s] HA timeout for %s\n",
+                  kind == "binary" ? "BinaryHistory" : "StateHistory",
+                  entity_id.c_str());
+  }
+}
+
+#if TAB5_HAS_ONEWIRE_DS18X20
+static constexpr uint32_t kExternalTempSampleMs = 3000;
+static constexpr uint32_t kExternalTempConvertMs = 800;
+static constexpr uint32_t kExternalTempDiscoveryRetryMs = 2000;
+static constexpr uint8_t kExternalTempMaxFailures = 1;
+static constexpr uint32_t kExternalTempMqttRepublishMs = 60000;
+static constexpr uint32_t kExternalTempProbeLogMs = 10000;
+
+static OneWire g_onewire_1(1);
+static OneWire g_onewire_50(50);
+static DallasTemperature g_dallas_1(&g_onewire_1);
+static DallasTemperature g_dallas_50(&g_onewire_50);
+
+struct ExternalTempCandidate {
+  uint8_t pin;
+  OneWire* bus;
+  DallasTemperature* sensor;
+};
+
+static const ExternalTempCandidate kExternalTempCandidates[] = {
+  {50, &g_onewire_50, &g_dallas_50},
+  {1, &g_onewire_1, &g_dallas_1},
+};
+
+static DallasTemperature* g_external_dallas = nullptr;
+static uint8_t g_external_pin = 0xFF;
+static DeviceAddress g_external_addr = {0};
+static uint8_t g_external_failures = 0;
+static bool g_external_pending = false;
+static uint32_t g_external_request_ms = 0;
+static uint32_t g_external_last_sample_ms = 0;
+static uint32_t g_external_last_discovery_ms = 0;
+static uint32_t g_external_last_mqtt_ms = 0;
+static uint32_t g_external_last_probe_log_ms = 0;
+static String g_external_last_payload;
+
+static bool is_supported_ds18x20_family(uint8_t family) {
+  return family == 0x28 || family == 0x10 || family == 0x22;
+}
+
+static bool init_external_temp_on_bus(const ExternalTempCandidate& candidate,
+                                      DeviceAddress out_addr,
+                                      bool verbose_log) {
+  if (!candidate.bus || !candidate.sensor) return false;
+
+  pinMode(candidate.pin, INPUT_PULLUP);
+  delay(2);
+
+  uint8_t addr[8] = {0};
+  candidate.bus->reset_search();
+  if (!candidate.bus->search(addr)) {
+    if (verbose_log) {
+      Serial.printf("[OneWire] GPIO %u: no 1-Wire device found\n",
+                    static_cast<unsigned>(candidate.pin));
+    }
+    return false;
+  }
+
+  if (OneWire::crc8(addr, 7) != addr[7]) {
+    if (verbose_log) {
+      Serial.printf("[OneWire] GPIO %u: CRC error on bus\n",
+                    static_cast<unsigned>(candidate.pin));
+    }
+    return false;
+  }
+
+  if (!is_supported_ds18x20_family(addr[0])) {
+    if (verbose_log) {
+      Serial.printf("[OneWire] GPIO %u: unknown family 0x%02X\n",
+                    static_cast<unsigned>(candidate.pin),
+                    static_cast<unsigned>(addr[0]));
+    }
+    return false;
+  }
+
+  candidate.sensor->begin();
+  candidate.sensor->setWaitForConversion(false);
+  memcpy(out_addr, addr, sizeof(DeviceAddress));
+  candidate.sensor->setResolution(out_addr, 12);
+  Serial.printf("[OneWire] DS18x20 found on GPIO %u (family 0x%02X)\n",
+                static_cast<unsigned>(candidate.pin),
+                static_cast<unsigned>(addr[0]));
+  return true;
+}
+
+static void discover_external_temp_sensor(uint32_t now_ms) {
+  if (g_external_dallas) return;
+  if (g_external_last_discovery_ms != 0 &&
+      (int32_t)(now_ms - g_external_last_discovery_ms) < static_cast<int32_t>(kExternalTempDiscoveryRetryMs)) {
+    return;
+  }
+  g_external_last_discovery_ms = now_ms;
+  const bool verbose_log =
+    (g_external_last_probe_log_ms == 0) ||
+    ((int32_t)(now_ms - g_external_last_probe_log_ms) >= static_cast<int32_t>(kExternalTempProbeLogMs));
+  if (verbose_log) {
+    g_external_last_probe_log_ms = now_ms;
+  }
+
+  DeviceAddress addr = {0};
+  for (const auto& candidate : kExternalTempCandidates) {
+    if (!candidate.sensor || !candidate.bus) continue;
+    if (init_external_temp_on_bus(candidate, addr, verbose_log)) {
+      g_external_dallas = candidate.sensor;
+      g_external_pin = candidate.pin;
+      memcpy(g_external_addr, addr, sizeof(DeviceAddress));
+      g_external_failures = 0;
+      g_external_pending = false;
+      return;
+    }
+  }
+
+  if (verbose_log) {
+    Serial.println("[OneWire] No DS18x20 found on GPIO 1/50 (check DATA + 4.7k pull-up to 3V3).");
+  }
+}
+
+static void service_external_temp_sensor() {
+  const uint32_t now_ms = millis();
+  discover_external_temp_sensor(now_ms);
+  if (!g_external_dallas) {
+    g_external_temp_valid = false;
+    return;
+  }
+
+  if (!g_external_pending) {
+    if (g_external_last_sample_ms != 0 &&
+        (int32_t)(now_ms - g_external_last_sample_ms) < static_cast<int32_t>(kExternalTempSampleMs)) {
+      return;
+    }
+    g_external_dallas->requestTemperaturesByAddress(g_external_addr);
+    g_external_request_ms = now_ms;
+    g_external_pending = true;
+    return;
+  }
+
+  if ((int32_t)(now_ms - g_external_request_ms) < static_cast<int32_t>(kExternalTempConvertMs)) {
+    return;
+  }
+
+  g_external_pending = false;
+  g_external_last_sample_ms = now_ms;
+
+  const float value_c = g_external_dallas->getTempC(g_external_addr);
+  if (value_c == DEVICE_DISCONNECTED_C || value_c < -55.0f || value_c > 125.0f) {
+    g_external_temp_valid = false;
+    if (g_external_failures < 255) ++g_external_failures;
+    if (g_external_failures >= kExternalTempMaxFailures) {
+      Serial.println("[OneWire] Sensor disconnected, starting new search...");
+      g_external_dallas = nullptr;
+      g_external_pin = 0xFF;
+      g_external_failures = 0;
+      g_external_last_discovery_ms = now_ms - kExternalTempDiscoveryRetryMs;
+    }
+    return;
+  }
+
+  g_external_failures = 0;
+  g_external_temp_valid = true;
+  g_external_temp_c = value_c;
+}
+#else
+static constexpr uint32_t kExternalTempMqttRepublishMs = 60000;
+static uint32_t g_external_last_mqtt_ms = 0;
+static String g_external_last_payload;
+
+static void service_external_temp_sensor() {
+  static bool warned = false;
+  if (!warned) {
+    warned = true;
+    Serial.println("[OneWire] OneWire/DallasTemperature not found, external DS18x20 sensor disabled.");
+  }
+  g_external_temp_valid = false;
+}
+#endif
+
+static void sync_external_temp_entity(bool publish_mqtt) {
+  service_external_temp_sensor();
+  const uint32_t now_ms = millis();
+  store_external_temp_history(now_ms);
+
+  String sensor_name = "Waveshare Intern DS18x20 Temperatur (GPIO 1/50)";
+#if TAB5_HAS_ONEWIRE_DS18X20
+  if (g_external_pin != 0xFF) {
+    sensor_name = "Waveshare Intern DS18x20 Temperatur (GPIO ";
+    sensor_name += String(static_cast<unsigned>(g_external_pin));
+    sensor_name += ")";
+  }
+#endif
+  haBridgeConfig.registerSensorMeta(kEntityExternalTemperature, sensor_name, "C");
+  haBridgeConfig.updateEntityMeta(kEntityExternalTemperature, sensor_name, "C", "thermometer");
+
+  char temp_payload[24];
+  const char* payload = "unavailable";
+  if (g_external_temp_valid && !std::isnan(g_external_temp_c) && !std::isinf(g_external_temp_c)) {
+    dtostrf(g_external_temp_c, 0, 1, temp_payload);
+    payload = temp_payload;
+  }
+
+  haBridgeConfig.updateSensorValue(kEntityExternalTemperature, payload);
+  if (g_external_last_grid_payload != payload ||
+      g_external_last_grid_ms == 0 ||
+      (int32_t)(now_ms - g_external_last_grid_ms) >= static_cast<int32_t>(kExternalTempGridRefreshMs)) {
+    update_all_grids(kEntityExternalTemperature, payload);
+    g_external_last_grid_payload = payload;
+    g_external_last_grid_ms = now_ms;
+  }
+
+  if (!publish_mqtt) return;
+  if (!networkManager.isMqttConnected()) return;
+
+  if (g_external_last_payload == payload &&
+      (int32_t)(now_ms - g_external_last_mqtt_ms) < static_cast<int32_t>(kExternalTempMqttRepublishMs)) {
+    return;
+  }
+
+  String topic = buildHaStatestreamTopic(kEntityExternalTemperature, "state");
+  networkManager.mqttEnqueuePublish(topic.c_str(), payload, true);
+  g_external_last_payload = payload;
+  g_external_last_mqtt_ms = now_ms;
+
+#if TAB5_HAS_ONEWIRE_DS18X20
+  static bool reported_pin = false;
+  if (!reported_pin && g_external_pin != 0xFF) {
+    Serial.printf("[OneWire] Publish to %s (GPIO %u)\n",
+                  topic.c_str(),
+                  static_cast<unsigned>(g_external_pin));
+    reported_pin = true;
+  }
+#endif
+}
+
+static int readBatterySocPercent() {
+  batteryStateUpdate();
+  const BatteryTelemetry& batt = batteryStateGet();
+
+  if (batt.level_valid && batt.level_pct >= 0 && batt.level_pct <= 100) {
+    g_soc_pct = batt.level_pct;
+  } else if (g_soc_pct < 0 &&
+             !batt.battery_missing &&
+             batt.raw_level_pct >= 0 &&
+             batt.raw_level_pct <= 100) {
+    // One-time seed on startup only. Do not continuously fall back to raw,
+    // otherwise short raw spikes can create vertical jumps in history graphs.
+    g_soc_pct = batt.raw_level_pct;
+  }
+
+  if (g_soc_pct < 0) return 0;
+  if (g_soc_pct > 100) return 100;
+  return g_soc_pct;
+}
+
+static void sync_internal_battery_entity() {
+  if (!batteryStateSupportsMeasurement() || batteryStateIsBatteryMissing()) {
+    return;
+  }
+  const int soc = readBatterySocPercent();
+  char soc_payload[8];
+  snprintf(soc_payload, sizeof(soc_payload), "%d", soc);
+
+  const char* sensor_name = "WS_P4 Intern Batterie SoC";
+  haBridgeConfig.registerSensorMeta(kEntityInternalBatterySoc, sensor_name, "%");
+  haBridgeConfig.updateEntityMeta(kEntityInternalBatterySoc, sensor_name, "%", "battery");
+  haBridgeConfig.updateSensorValue(kEntityInternalBatterySoc, soc_payload);
+  update_all_grids(kEntityInternalBatterySoc, soc_payload);
+}
+
+static const char* kSleepOptionLabels[] = {
+  "5 s",
+  "15 s",
+  "30 s",
+  "60 s",
+  "5 min",
+  "15 min",
+  "30 min",
+  "60 min",
+  "Nie"
+};
+
+static constexpr size_t kSleepOptionLabelCount =
+    sizeof(kSleepOptionLabels) / sizeof(kSleepOptionLabels[0]);
+
+static const char* kSleepOptionsJson =
+    "[\"5 s\",\"15 s\",\"30 s\",\"60 s\",\"5 min\",\"15 min\",\"30 min\",\"60 min\",\"Nie\"]";
+
+using RouteHandler = void (*)(const char* payload, size_t len);
+
+struct TopicRoute {
+  TopicKey key;
+  RouteHandler handler;
+  bool use_large_buffer;
+};
+
+struct DynamicSensorRoute {
+  String topic;
+  String entity_id;
+  std::vector<uint8_t> slots;
+};
+
+static std::vector<DynamicSensorRoute> g_dynamic_routes;
+
+struct DynamicWeatherRoute {
+  String topic;
+  String entity_id;
+};
+
+static std::vector<DynamicWeatherRoute> g_dynamic_weather_routes;
+
+static void handleOutside(const char* payload, size_t) {
+  g_outside_c = atof(payload);
+}
+
+static void handleInside(const char* payload, size_t) {
+  g_inside_c = atof(payload);
+}
+
+static void handleSoc(const char* payload, size_t) {
+  g_soc_pct = atoi(payload);
+}
+
+static void handleSceneCommand(const char* payload, size_t) {
+  Serial.printf("Scene command received: %s\n", payload);
+}
+
+static void handleHaWohnTemp(const char*, size_t) {
+  // Legacy fixed topic: nothing reads this value any more. It only printed
+  // every state into the log.
+}
+
+static bool parseBoolPayload(const char* payload, bool* out) {
+  if (!payload || !out) return false;
+  String s(payload);
+  s.trim();
+  s.toLowerCase();
+  if (s == "1" || s == "on" || s == "true" || s == "yes") {
+    *out = true;
+    return true;
+  }
+  if (s == "0" || s == "off" || s == "false" || s == "no") {
+    *out = false;
+    return true;
+  }
+  return false;
+}
+
+static bool entityEquals(const char* entity_id, const char* expected) {
+  if (!entity_id || !expected) return false;
+  String a(entity_id);
+  String b(expected);
+  a.trim();
+  b.trim();
+  return a.equalsIgnoreCase(b);
+}
+
+static int brightnessPctFromRaw(int raw) {
+  if (raw < 0) raw = 0;
+  if (raw > 255) raw = 255;
+  return Device::backlightPercentFromRaw(static_cast<uint8_t>(raw));
+}
+
+static uint8_t brightnessRawFromPct(int pct) {
+  if (pct < Device::kConfiguredBrightnessPercentMin) {
+    pct = Device::kConfiguredBrightnessPercentMin;
+  }
+  if (pct > 100) pct = 100;
+  return Device::backlightRawFromPercent(static_cast<uint8_t>(pct));
+}
+
+static const char* sleepLabelFromConfig(bool enabled, uint16_t seconds) {
+  if (!enabled) return "Nie";
+  uint16_t closest = kSleepOptionsSec[0];
+  size_t closest_index = 0;
+  uint16_t best_diff = (seconds > closest) ? (seconds - closest) : (closest - seconds);
+  for (size_t i = 1; i < kSleepOptionsSecCount; ++i) {
+    uint16_t option = kSleepOptionsSec[i];
+    uint16_t diff = (seconds > option) ? (seconds - option) : (option - seconds);
+    if (diff < best_diff) {
+      best_diff = diff;
+      closest = option;
+      closest_index = i;
+    }
+  }
+  if (closest_index >= kSleepOptionLabelCount - 1) {
+    closest_index = kSleepOptionLabelCount - 2;
+  }
+  return kSleepOptionLabels[closest_index];
+}
+
+static bool parseSleepPayload(const char* payload, bool* enabled, uint16_t* seconds) {
+  if (!payload || !enabled || !seconds) return false;
+  String s(payload);
+  s.trim();
+  s.toLowerCase();
+  if (!s.length()) return false;
+
+  if (s == "nie" || s == "never" || s == "off" || s == "0") {
+    *enabled = false;
+    return true;
+  }
+
+  for (size_t i = 0; i + 1 < kSleepOptionLabelCount; ++i) {
+    String label = kSleepOptionLabels[i];
+    label.toLowerCase();
+    if (s == label) {
+      *enabled = true;
+      *seconds = kSleepOptionsSec[i];
+      return true;
+    }
+  }
+
+  String compact = s;
+  compact.replace(" ", "");
+  bool is_min = compact.endsWith("min") || compact.endsWith("m");
+  bool is_sec = compact.endsWith("s");
+  int value = 0;
+  bool found_digit = false;
+  for (size_t i = 0; i < compact.length(); ++i) {
+    char c = compact.charAt(i);
+    if (c >= '0' && c <= '9') {
+      value = value * 10 + (c - '0');
+      found_digit = true;
+    } else if (found_digit) {
+      break;
+    }
+  }
+  if (!found_digit) return false;
+
+  uint32_t secs = is_min ? (uint32_t)value * 60u : (uint32_t)value;
+  if (!is_min && !is_sec && value > 0 && value <= 3600) {
+    secs = (uint32_t)value;
+  }
+  if (secs == 0) {
+    *enabled = false;
+    return true;
+  }
+
+  *enabled = true;
+  *seconds = static_cast<uint16_t>(secs);
+  return true;
+}
+
+static void handleDisplayBrightnessCommand(const char* payload, size_t) {
+  if (!payload || !*payload) return;
+  int command_value = atoi(payload);
+  uint8_t value = 0;
+  if (command_value > 100) {
+    // Compatibility with Bridge versions that used the old 121..255 raw
+    // protocol. New firmware and Bridge versions exchange 1..100 percent.
+    if (command_value > 255) command_value = 255;
+    const uint8_t configured_min = Device::backlightRawFromPercent(
+        Device::kConfiguredBrightnessPercentMin);
+    if (command_value < configured_min) {
+      command_value = configured_min;
+    }
+    value = static_cast<uint8_t>(command_value);
+  } else {
+    value = brightnessRawFromPct(command_value);
+  }
+
+  // An HA change to normal brightness must not brighten a visible
+  // screensaver. During sleep, update only the safe wake brightness and
+  // keep the backlight off.
+  if (!is_image_screensaver_visible()) {
+    powerManager.setDisplayBrightness(value);
+  }
+
+  const DeviceConfig& cfg = configManager.getConfig();
+  configManager.saveDisplaySettings(
+      value,
+      cfg.auto_sleep_enabled,
+      cfg.auto_sleep_seconds,
+      cfg.auto_sleep_battery_enabled,
+      cfg.auto_sleep_battery_seconds,
+      cfg.display_rotation_mode,
+      cfg.display_rotated_180,
+      cfg.display_rotation_quarters,
+      cfg.wake_mode_mains,
+      cfg.wake_mode_battery);
+  mqttPublishDeviceSettings();
+}
+
+static void handleScreensaverBrightnessCommand(const char* payload, size_t) {
+  if (!payload || !*payload) return;
+  int percent = atoi(payload);
+  if (percent < Device::kConfiguredBrightnessPercentMin) {
+    percent = Device::kConfiguredBrightnessPercentMin;
+  }
+  if (percent > kScreensaverBrightnessPctMax) {
+    percent = kScreensaverBrightnessPctMax;
+  }
+
+  configManager.saveScreensaverBrightness(static_cast<uint8_t>(percent));
+  image_screensaver_brightness_changed();
+  mqttPublishDeviceSettings();
+}
+
+static void handleDisplayRotateCommand(const char* payload, size_t) {
+  bool rotate = false;
+  if (!parseBoolPayload(payload, &rotate)) return;
+  displayManager.setRotationFlipped(rotate);
+  settings_sync_display_rotation(rotate);
+
+  const DeviceConfig& cfg = configManager.getConfig();
+  uint8_t rotation_quarters = rotate ? Device::kRotationFlipped : Device::kRotationDefault;
+  uint8_t rotation_mode = rotate ? kDisplayRotationFlipped : kDisplayRotationNormal;
+  configManager.saveDisplaySettings(
+      cfg.display_brightness,
+      cfg.auto_sleep_enabled,
+      cfg.auto_sleep_seconds,
+      cfg.auto_sleep_battery_enabled,
+      cfg.auto_sleep_battery_seconds,
+      rotation_mode,
+      rotate,
+      rotation_quarters,
+      cfg.wake_mode_mains,
+      cfg.wake_mode_battery);
+  mqttPublishDeviceSettings();
+}
+
+// Home Assistant's theme select (Bridge capability display_theme): the
+// stored setting as a stable id, "dark", "light" or "auto".
+static const char* display_theme_id(uint8_t theme) {
+  return theme == theme_schedule::kAutomatic ? "auto" : theme == 1 ? "light" : "dark";
+}
+
+static void handleDisplayThemeCommand(const char* payload, size_t) {
+  if (!payload) return;
+  String value(payload);
+  value.trim();
+  value.toLowerCase();
+  for (uint8_t theme = 0; theme <= theme_schedule::kAutomatic; ++theme) {
+    if (value == display_theme_id(theme)) {
+      theme_schedule::store(theme);
+      return;
+    }
+  }
+}
+
+// Home Assistant's rotation select (capability display_rotation): the steps
+// of the panel's Settings row (tab_settings.cpp rotation_index) in degrees
+// from the profile's own turn, 0/90/180/270 where the panel turns in quarter
+// turns, else 0/180 (user 2026-10-23: the old switch knew only 180).
+static int display_rotation_degrees(const DeviceConfig& cfg) {
+  const uint8_t quarters = Device::normalizeRotationQuarterTurns(cfg.display_rotation_quarters);
+  if (Device::supportsQuarterTurnRotation()) {
+    return static_cast<int>((quarters - Device::kRotationDefault) & 0x03) * 90;
+  }
+  return quarters == Device::kRotationFlipped ? 180 : 0;
+}
+
+static void handleDisplayRotationCommand(const char* payload, size_t) {
+  if (!payload) return;
+  char* end = nullptr;
+  const long degrees = strtol(payload, &end, 10);
+  if (end == payload || degrees < 0 || degrees % 90 != 0) return;
+  const bool quarter_turns = Device::supportsQuarterTurnRotation();
+  if (degrees > 270 || (!quarter_turns && degrees % 180 != 0)) return;
+  settings_select_display_rotation(static_cast<uint8_t>(degrees / (quarter_turns ? 90 : 180)));
+}
+
+static void handleDisplaySleepCommand(const char* payload, size_t) {
+  bool sleep = false;
+  if (!parseBoolPayload(payload, &sleep)) return;
+  if (sleep) {
+    powerManager.enterDisplaySleep();
+  } else {
+    powerManager.wakeFromDisplaySleep("mqtt-cmd");
+  }
+  mqttPublishDeviceSettings();
+}
+
+static void handleSleepMainsCommand(const char* payload, size_t) {
+  bool enabled = false;
+  uint16_t seconds = 0;
+  if (!parseSleepPayload(payload, &enabled, &seconds)) return;
+
+  const DeviceConfig& cfg = configManager.getConfig();
+  uint16_t new_seconds = enabled ? seconds : cfg.auto_sleep_seconds;
+  configManager.saveDisplaySettings(
+      cfg.display_brightness,
+      enabled,
+      new_seconds,
+      cfg.auto_sleep_battery_enabled,
+      cfg.auto_sleep_battery_seconds,
+      cfg.display_rotation_mode,
+      cfg.display_rotated_180,
+      cfg.display_rotation_quarters,
+      cfg.wake_mode_mains,
+      cfg.wake_mode_battery);
+  mqttPublishDeviceSettings();
+}
+
+static void handleSleepBatteryCommand(const char* payload, size_t) {
+  bool enabled = false;
+  uint16_t seconds = 0;
+  if (!parseSleepPayload(payload, &enabled, &seconds)) return;
+
+  const DeviceConfig& cfg = configManager.getConfig();
+  uint16_t new_seconds = enabled ? seconds : cfg.auto_sleep_battery_seconds;
+  configManager.saveDisplaySettings(
+      cfg.display_brightness,
+      cfg.auto_sleep_enabled,
+      cfg.auto_sleep_seconds,
+      enabled,
+      new_seconds,
+      cfg.display_rotation_mode,
+      cfg.display_rotated_180,
+      cfg.display_rotation_quarters,
+      cfg.wake_mode_mains,
+      cfg.wake_mode_battery);
+  mqttPublishDeviceSettings();
+}
+
+static void sync_local_device_entities(bool publish_mqtt) {
+  const DeviceConfig& cfg = configManager.getConfig();
+
+  const int bright_pct = brightnessPctFromRaw(static_cast<int>(cfg.display_brightness));
+  char bright_payload[96];
+  snprintf(bright_payload, sizeof(bright_payload), "{\"state\":\"on\",\"brightness_pct\":%d}", bright_pct);
+
+  haBridgeConfig.updateSensorValue(kEntityDisplayBrightness, bright_payload);
+  haBridgeConfig.updateEntityMeta(kEntityDisplayBrightness, "Display Helligkeit", "%", "brightness-6");
+
+  char screensaver_bright_payload[96];
+  snprintf(screensaver_bright_payload, sizeof(screensaver_bright_payload),
+           "{\"state\":\"on\",\"brightness_pct\":%u}",
+           static_cast<unsigned>(cfg.screensaver_brightness_pct));
+  haBridgeConfig.updateSensorValue(kEntityScreensaverBrightness,
+                                   screensaver_bright_payload);
+  haBridgeConfig.updateEntityMeta(kEntityScreensaverBrightness,
+                                  "Screensaver Helligkeit", "%",
+                                  "brightness-4");
+
+  const char* rotate_state = cfg.display_rotated_180 ? "ON" : "OFF";
+  haBridgeConfig.updateSensorValue(kEntityDisplayRotate, rotate_state);
+  haBridgeConfig.updateEntityMeta(kEntityDisplayRotate, "Display Rotation", "", "screen-rotation");
+
+  const char* sleep_state = powerManager.isInSleep() ? "ON" : "OFF";
+  haBridgeConfig.updateSensorValue(kEntityDisplaySleep, sleep_state);
+  haBridgeConfig.updateEntityMeta(kEntityDisplaySleep, "Display Sleep", "", "sleep");
+
+  update_all_grids(kEntityDisplayBrightness, bright_payload);
+  update_all_grids(kEntityScreensaverBrightness,
+                   screensaver_bright_payload);
+  update_all_grids(kEntityDisplayRotate, rotate_state);
+  update_all_grids(kEntityDisplaySleep, sleep_state);
+  sync_internal_battery_entity();
+  // Explicit local I/O owns all external temperature telemetry.
+  (void)publish_mqtt;
+}
+
+static bool resolve_toggle_action(const char* action, bool current, bool* desired) {
+  if (!desired) return false;
+  if (!action || !*action) {
+    *desired = !current;
+    return true;
+  }
+  String s(action);
+  s.trim();
+  s.toLowerCase();
+  if (s == "toggle") {
+    *desired = !current;
+    return true;
+  }
+  return parseBoolPayload(s.c_str(), desired);
+}
+
+static bool handle_local_switch_command(const char* entity_id, const char* action) {
+  if (hardwareIo.handleLocalEntityCommand(entity_id, action)) return true;
+  if (entityEquals(entity_id, kEntityDisplayBrightness)) {
+    sync_local_device_entities(false);
+    return true;
+  }
+  if (entityEquals(entity_id, kEntityScreensaverBrightness)) {
+    sync_local_device_entities(false);
+    return true;
+  }
+  if (entityEquals(entity_id, kEntityDisplayRotate)) {
+    bool desired = false;
+    const DeviceConfig& cfg = configManager.getConfig();
+    if (!resolve_toggle_action(action, cfg.display_rotated_180, &desired)) return true;
+    handleDisplayRotateCommand(desired ? "ON" : "OFF", 0);
+    return true;
+  }
+  if (entityEquals(entity_id, kEntityDisplaySleep)) {
+    bool desired = false;
+    if (!resolve_toggle_action(action, powerManager.isInSleep(), &desired)) return true;
+    handleDisplaySleepCommand(desired ? "ON" : "OFF", 0);
+    return true;
+  }
+  return false;
+}
+
+static bool handle_local_light_command(const char* entity_id, const char* state, int brightness_pct) {
+  if (entityEquals(entity_id, kEntityDisplayBrightness)) {
+    if (brightness_pct >= 0) {
+      char buf[8];
+      snprintf(buf, sizeof(buf), "%d", brightness_pct);
+      handleDisplayBrightnessCommand(buf, 0);
+    } else {
+      (void)state;
+      sync_local_device_entities(false);
+    }
+    return true;
+  }
+  if (entityEquals(entity_id, kEntityScreensaverBrightness)) {
+    if (brightness_pct >= 0) {
+      char buf[8];
+      snprintf(buf, sizeof(buf), "%d", brightness_pct);
+      handleScreensaverBrightnessCommand(buf, 0);
+    } else {
+      (void)state;
+      sync_local_device_entities(false);
+    }
+    return true;
+  }
+  return false;
+}
+
+static void handleCameraStatus(const char* payload, size_t) {
+  camera_popup_handle_mqtt_status(payload);
+}
+
+// The Bridge's answers to Lock and Alarm commands (bridge-contract.md).
+static void handleLockResult(const char* payload, size_t length) {
+  device_control::queue_result(TILE_LOCK, payload, length);
+}
+
+static void handleAlarmResult(const char* payload, size_t length) {
+  device_control::queue_result(TILE_ALARM, payload, length);
+}
+
+static const TopicRoute kRoutes[] = {
+  {TopicKey::SENSOR_OUT, handleOutside, false},
+  {TopicKey::SENSOR_IN, handleInside, false},
+  {TopicKey::SENSOR_SOC, handleSoc, false},
+  {TopicKey::SCENE_CMND, handleSceneCommand, false},
+  {TopicKey::HA_WOHN_TEMP, handleHaWohnTemp, false},
+  {TopicKey::DISPLAY_BRIGHTNESS_CMND, handleDisplayBrightnessCommand, false},
+  {TopicKey::SCREENSAVER_BRIGHTNESS_CMND, handleScreensaverBrightnessCommand, false},
+  {TopicKey::DISPLAY_ROTATE_CMND, handleDisplayRotateCommand, false},
+  {TopicKey::DISPLAY_ROTATION_CMND, handleDisplayRotationCommand, false},
+  {TopicKey::DISPLAY_THEME_CMND, handleDisplayThemeCommand, false},
+  {TopicKey::DISPLAY_SLEEP_CMND, handleDisplaySleepCommand, false},
+  {TopicKey::SLEEP_MAINS_CMND, handleSleepMainsCommand, false},
+  {TopicKey::SLEEP_BAT_CMND, handleSleepBatteryCommand, false},
+  {TopicKey::CAMERA_STAT, handleCameraStatus, true},
+  // The answers carry the entity id (up to 255 bytes): an alarm panel's
+  // answer outgrew SMALL_BUF, was cut off, failed to parse and the code entry
+  // waited for "No answer" although the command had run.
+  {TopicKey::LOCK_STAT, handleLockResult, true},
+  {TopicKey::ALARM_STAT, handleAlarmResult, true},
+};
+
+static String buildHaStatestreamTopic(const String& entity_id, const char* suffix) {
+  String topic = mqttTopics.haPrefix();
+  if (!topic.length()) {
+    topic = "ha/statestream";
+  }
+  topic += "/";
+  for (size_t i = 0; i < entity_id.length(); ++i) {
+    char c = entity_id.charAt(i);
+    topic += (c == '.') ? '/' : c;
+  }
+  topic += "/";
+  topic += (suffix && *suffix) ? suffix : "state";
+  return topic;
+}
+
+// The screensaver's live camera picture topic (mqttSetLivePicture).
+static String g_live_picture_topic;
+
+void mqttSetLivePicture(const char* entity_id, uint8_t fit, uint8_t every) {
+  String topic;
+  if (entity_id && *entity_id) {
+    topic = buildHaStatestreamTopic(String(entity_id), bridge_images::screenSuffix(fit, every));
+  }
+  if (topic == g_live_picture_topic) return;
+  if (networkManager.isMqttConnected() && networkManager.linkConfigured()) {
+    if (g_live_picture_topic.length()) {
+      networkManager.mqttEnqueueUnsubscribe(g_live_picture_topic.c_str());
+    }
+    if (topic.length()) networkManager.mqttEnqueueSubscribe(topic.c_str());
+  }
+  Serial.printf("[Images] Live picture: %s\n", topic.length() ? topic.c_str() : "none");
+  g_live_picture_topic = topic;
+}
+
+// The Camera tiles' picture topics (mqttSetTilePictures).
+static std::vector<String> g_tile_picture_topics;
+
+void mqttSetTilePictures(const String* entities, const String* suffixes, size_t count) {
+  std::vector<String> topics;
+  topics.reserve(count);
+  for (size_t i = 0; i < count; ++i) {
+    const String topic = buildHaStatestreamTopic(entities[i], suffixes[i].c_str());
+    if (std::find(topics.begin(), topics.end(), topic) == topics.end()) topics.push_back(topic);
+  }
+  if (topics == g_tile_picture_topics) return;
+  if (networkManager.isMqttConnected() && networkManager.linkConfigured()) {
+    // The screensaver's live topic stays when a tile drops the same one.
+    for (const String& old : g_tile_picture_topics) {
+      if (old != g_live_picture_topic && std::find(topics.begin(), topics.end(), old) == topics.end()) {
+        networkManager.mqttEnqueueUnsubscribe(old.c_str());
+      }
+    }
+    for (const String& topic : topics) {
+      if (std::find(g_tile_picture_topics.begin(), g_tile_picture_topics.end(), topic) ==
+          g_tile_picture_topics.end()) {
+        networkManager.mqttEnqueueSubscribe(topic.c_str());
+      }
+    }
+  }
+  Serial.printf("[Images] Tile pictures: %u\n", static_cast<unsigned>(topics.size()));
+  g_tile_picture_topics.swap(topics);
+}
+
+static void rebuildDynamicRoutes(std::vector<DynamicSensorRoute>& routes) {
+  routes.clear();
+  vacuum_map::prefetch_clear();
+
+  auto add_route = [&](const String& entity, int slot_index, const char* suffix = "state") {
+    String ent = entity;
+    ent.trim();
+    if (!ent.length()) return;
+    // Physical panel I/O entities use the same IDs as HA but are updated
+    // and controlled directly on this panel. A parallel HA statestream
+    // subscription would be redundant and could overwrite real GPIO state
+    // with a stale remote value.
+    if (hardwareIo.isLocalEntityId(ent.c_str())) return;
+
+    String topic = buildHaStatestreamTopic(ent, suffix);
+    auto it = std::find_if(
+        routes.begin(),
+        routes.end(),
+        [&](const DynamicSensorRoute& r) { return r.topic == topic; });
+
+    if (it == routes.end()) {
+      DynamicSensorRoute route;
+      route.topic = topic;
+      route.entity_id = ent;
+      if (slot_index >= 0) {
+        route.slots.push_back(static_cast<uint8_t>(slot_index));
+      }
+      routes.push_back(route);
+    } else {
+      if (slot_index >= 0) {
+        it->slots.push_back(static_cast<uint8_t>(slot_index));
+      }
+      if (!it->entity_id.equalsIgnoreCase(ent)) {
+        it->entity_id = ent;  // prefer latest casing
+      }
+    }
+  };
+
+  const HaBridgeConfigData& cfg = haBridgeConfig.get();
+  // Every entity the Bridge offers keeps its additive topic subscribed, not
+  // only those on a tile: a newly chosen Number or Lock shows its state at
+  // once instead of after the save and the retained message (the Lock,
+  // Alarm panel and Fan detail only followed their tiles and took seconds).
+  const struct {
+    const String* list;
+    const char* suffix;
+  } offered[] = {{&cfg.numbers_text, "control"}, {&cfg.selects_text, "control"},
+                 {&cfg.datetimes_text, "control"}, {&cfg.locks_text, "detail"},
+                 {&cfg.alarm_panels_text, "detail"}, {&cfg.fans_text, "detail"},
+                 {&cfg.vacuums_text, "detail"},
+                 // Calendar tiles read the events of every offered calendar.
+                 {&cfg.calendars_text, "events"}};
+  // Events of calendars the Bridge stopped offering go.
+  calendar_store::forget_except(cfg.calendars_text);
+  for (const auto& entry : offered) {
+    const String& list = *entry.list;
+    int start = 0;
+    while (start < static_cast<int>(list.length())) {
+      int end = list.indexOf('\n', start);
+      if (end < 0) end = list.length();
+      add_route(list.substring(start, end), -1, entry.suffix);
+      start = end + 1;
+    }
+  }
+  // Legacy HA sensor slots
+  for (uint8_t slot = 0; slot < HA_SENSOR_SLOT_COUNT; ++slot) {
+    add_route(cfg.sensor_slots[slot], slot);
+  }
+
+  // Load sensor routes from every folder through TileConfig's PSRAM entity
+  // cache. Each folder needs a roughly 20 ms flash read only on the first
+  // scan or after a grid change; subsequent full-folder scans are cheap.
+  bool has_media_tiles = cfg.numbers_text.length() || cfg.selects_text.length() || cfg.datetimes_text.length();
+  auto add_grid_entities = [&](const FolderEntitySlotView* slots, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+      const FolderEntitySlotView& slot = slots[i];
+      // Rules on another entity (tile_icon_colors.h).
+      if (slot.rule_entity[0]) add_route(String(slot.rule_entity), -1, "state");
+      // Weather temperature/humidity sensors, one entity per line (a
+      // Vacuum's chosen map comes as a picture, not as a state).
+      for (const char* extra = slot.type == TILE_VACUUM ? "" : slot.extra_entities; *extra;) {
+        const char* end = strchr(extra, '\n');
+        const size_t length = end ? static_cast<size_t>(end - extra) : strlen(extra);
+        if (length) add_route(String(extra).substring(0, length), -1, "state");
+        if (!end) break;
+        extra = end + 1;
+      }
+      if (tileTypeSubscribesDynamicState(slot.type) &&
+          slot.entity[0]) {
+        // Lock, Alarm panel and Fan read the additive detail state.
+        add_route(String(slot.entity), -1,
+                  tileTypeIsEditableValue(slot.type) ? "control"
+                  : tileTypeIsDeviceControl(slot.type) ? "detail"
+                                                       : "state");
+        if (tileTypeIsEditableValue(slot.type)) has_media_tiles = true;
+        // A Vacuum's map picture from the start, like a player's cover.
+        if (slot.type == TILE_VACUUM) vacuum_map::prefetch(slot.entity, slot.extra_entities);
+        if (slot.type == TILE_MEDIA) {
+          has_media_tiles = true;
+          // New bridges publish cover-free state changes here first. Keep the
+          // normal state subscription as well for retained full payloads and
+          // compatibility with older bridge versions.
+          add_route(String(slot.entity), -1, "state_fast");
+          // Over the link the Bridge sends the cover as its own picture.
+          if (networkManager.linkConfigured()) {
+            add_route(String(slot.entity), -1, bridge_images::coverSuffix());
+          }
+        }
+      }
+    }
+  };
+
+  // Scan all folders, not just the active one
+  const std::vector<FolderEntry>& folders = tileConfig.getFolders();
+  FolderEntitySlotView slots[TILES_PER_GRID];
+  for (const auto& folder : folders) {
+    uint32_t t_load0 = millis();
+    bool loaded = tileConfig.getFolderEntitiesCached(folder.id, slots, TILES_PER_GRID);
+    uint32_t load_ms = millis() - t_load0;
+    if (load_ms >= 5) {
+      Serial.printf("[Bridge]   getFolderEntitiesCached(%u): %u ms\n", folder.id, (unsigned)load_ms);
+    }
+    if (loaded) {
+      add_grid_entities(slots, TILES_PER_GRID);
+    }
+    // This runs synchronously on the loop task (mqtt_process_inbound_queue ->
+    // processMqttMessage -> mqttReloadDynamicSlots), before lv_timer_handler()
+    // gets its turn at the end of loop(). On a cache miss (first scan / after
+    // a grid change) each folder still costs a flash read -- servicing LVGL
+    // between folders keeps the UI breathing during the reload.
+    lvglServiceDuringBlockingWork();
+  }
+
+  // The screensaver grid intentionally lives outside the folder tree.
+  // Add its entities separately to the same MQTT routes.
+  const TileGridConfig& screensaver_grid = screensaverConfig.tileGrid();
+  for (size_t i = 0; i < TILES_PER_GRID; ++i) {
+    const Tile& tile = screensaver_grid.tiles[i];
+    const String rule_entity = tileIconSourceEntity(tile.type, tile.icon_colors);
+    if (rule_entity.length()) add_route(rule_entity, -1, "state");
+    if (!tileTypeSubscribesScreensaverState(tile.type) ||
+        !tile.sensor_entity.length()) {
+      continue;
+    }
+    add_route(tile.sensor_entity, -1, tileTypeIsEditableValue(tile.type) ? "control" : "state");
+    if (tileTypeIsEditableValue(tile.type)) has_media_tiles = true;
+    if (tile.type == TILE_MEDIA) {
+      has_media_tiles = true;
+      add_route(tile.sensor_entity, -1, "state_fast");
+      if (networkManager.linkConfigured()) {
+        add_route(tile.sensor_entity, -1, bridge_images::coverSuffix());
+      }
+    }
+  }
+
+  // The screensaver's picture of an image entity stays subscribed, ready when
+  // the screensaver opens; a camera's still only while it shows it
+  // (mqttSetLivePicture), since the Bridge loads a new one every 10 s.
+  const ScreensaverConfigData& screensaver = screensaverConfig.get();
+  if (networkManager.linkConfigured() && screensaver.use_wallpapers &&
+      screensaver_uses_ha_picture(screensaver) &&
+      screensaver.picture_entity.startsWith("image.")) {
+    add_route(screensaver.picture_entity, -1, bridge_images::screenSuffix(screensaver.picture_fit, 0));
+  }
+
+  // Media states with embedded covers need about 19 KB, exceeding the
+  // 16 KB base receive buffer; the worker adjusts its size.
+  networkManager.setMqttMediaBufferNeeded(has_media_tiles);
+  // The tiles or the Bridge's lists changed: tell the Bridge which tile
+  // entities it does not release itself (network/bridge/entity_search.h).
+  entity_search::scheduleTilesReport();
+}
+
+// Scan at boot before networkManager.init(). If stored configuration
+// already contains media tiles, allocate the matching receive buffer
+// immediately so the first retained cover is not lost while buffer
+// growth waits for the startup burst to finish.
+bool mqttAnyMediaTileConfigured() {
+  const TileGridConfig& screensaver_grid = screensaverConfig.tileGrid();
+  for (size_t i = 0; i < TILES_PER_GRID; ++i) {
+    const Tile& tile = screensaver_grid.tiles[i];
+    if ((tile.type == TILE_MEDIA || tileTypeIsEditableValue(tile.type)) && tile.sensor_entity.length()) return true;
+  }
+  const std::vector<FolderEntry>& folders = tileConfig.getFolders();
+  FolderEntitySlotView slots[TILES_PER_GRID];
+  for (const auto& folder : folders) {
+    if (!tileConfig.getFolderEntitiesCached(folder.id, slots, TILES_PER_GRID)) continue;
+    for (size_t i = 0; i < TILES_PER_GRID; ++i) {
+      if ((slots[i].type == TILE_MEDIA || tileTypeIsEditableValue(slots[i].type)) && slots[i].entity[0]) return true;
+    }
+  }
+  return false;
+}
+
+static void rebuildDynamicWeatherRoutes(std::vector<DynamicWeatherRoute>& routes) {
+  routes.clear();
+
+  auto add_route = [&](const String& entity) {
+    String ent = entity;
+    ent.trim();
+    if (!ent.length()) return;
+
+    String topic = buildHaStatestreamTopic(ent, "weather");
+    auto it = std::find_if(
+        routes.begin(),
+        routes.end(),
+        [&](const DynamicWeatherRoute& r) { return r.topic == topic; });
+
+    if (it == routes.end()) {
+      DynamicWeatherRoute route;
+      route.topic = topic;
+      route.entity_id = ent;
+      routes.push_back(route);
+    } else if (!it->entity_id.equalsIgnoreCase(ent)) {
+      it->entity_id = ent;
+    }
+  };
+
+  const std::vector<FolderEntry>& folders = tileConfig.getFolders();
+  FolderEntitySlotView slots[TILES_PER_GRID];
+  for (const auto& folder : folders) {
+    uint32_t t_load0 = millis();
+    bool loaded = tileConfig.getFolderEntitiesCached(folder.id, slots, TILES_PER_GRID);
+    uint32_t load_ms = millis() - t_load0;
+    if (load_ms >= 5) {
+      Serial.printf("[Bridge]   getFolderEntitiesCached(%u): %u ms\n", folder.id, (unsigned)load_ms);
+    }
+    if (loaded) {
+      for (size_t i = 0; i < TILES_PER_GRID; ++i) {
+        const FolderEntitySlotView& slot = slots[i];
+        if (slot.type == TILE_WEATHER && slot.entity[0]) {
+          add_route(String(slot.entity));
+        }
+      }
+    }
+    // Same reasoning as rebuildDynamicRoutes() above: give LVGL a turn between
+    // folders so this synchronous MQTT-callback reload doesn't stall the screen.
+    lvglServiceDuringBlockingWork();
+  }
+}
+
+static bool tryHandleDynamicSensor(const char* topic, const char* payload,
+                                   size_t payload_len) {
+  for (const auto& route : g_dynamic_routes) {
+    if (route.topic == topic) {
+      if (route.topic.endsWith("/control")) {
+        if (payload_len <= EDITABLE_PAYLOAD_MAX) queue_editable_value(route.entity_id, payload);
+        return true;
+      }
+      if (route.topic.endsWith("/detail")) {
+        device_control::queue_detail(route.entity_id, payload, payload_len);
+        return true;
+      }
+      if (route.topic.endsWith("/events")) {
+        calendar_store::queue(route.entity_id, payload, payload_len);
+        return true;
+      }
+      if (route.entity_id.startsWith("binary_sensor.") &&
+          payload_len > BINARY_SENSOR_PAYLOAD_MAX) {
+        static uint32_t last_oversize_log_ms = 0;
+        const uint32_t now_ms = millis();
+        if (last_oversize_log_ms == 0 ||
+            static_cast<uint32_t>(now_ms - last_oversize_log_ms) >= 5000) {
+          last_oversize_log_ms = now_ms;
+          Serial.printf(
+              "[BinarySensor] Oversized state dropped: %s (%u bytes)\n",
+              route.entity_id.c_str(), static_cast<unsigned>(payload_len));
+        }
+        return true;
+      }
+      // Update tile-based system (display) - active folder only
+      tiles_update_sensor_by_entity(GridType::TAB0, route.entity_id.c_str(), payload);
+      // Update sensor values map (for web interface)
+      haBridgeConfig.updateSensorValue(route.entity_id, payload);
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool tryHandleDynamicWeather(const char* topic, const char* payload) {
+  for (const auto& route : g_dynamic_weather_routes) {
+    if (route.topic == topic) {
+      tiles_update_weather_by_entity(GridType::TAB0, route.entity_id.c_str(), payload);
+      return true;
+    }
+  }
+  return false;
+}
+
+static constexpr size_t SMALL_BUF = 96;
+static constexpr size_t LARGE_BUF = 32768;
+static constexpr size_t CFG_BUF = 32768;
+static char small_buf[SMALL_BUF];
+static char* g_large_buf = nullptr;
+static char* g_cfg_buf = nullptr;
+
+static char* mqttScratchBuffer(char*& slot, size_t bytes, const char* name) {
+  if (slot) return slot;
+  slot = static_cast<char*>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  const char* where = "PSRAM";
+  if (!slot) {
+    slot = static_cast<char*>(heap_caps_malloc(bytes, MALLOC_CAP_8BIT));
+    where = "internal";
+  }
+  if (!slot) {
+    Serial.printf("[%s] Scratch buffer alloc failed: %s %u bytes\n", networkManager.bridgeLogName(),
+                  name ? name : "?",
+                  static_cast<unsigned>(bytes));
+    return nullptr;
+  }
+  Serial.printf("[%s] Scratch buffer %s: %u bytes in %s\n", networkManager.bridgeLogName(),
+                name ? name : "?",
+                static_cast<unsigned>(bytes),
+                where);
+  return slot;
+}
+
+static char* mqttLargeBuffer() {
+  return mqttScratchBuffer(g_large_buf, LARGE_BUF, "large");
+}
+
+static char* mqttConfigBuffer() {
+  return mqttScratchBuffer(g_cfg_buf, CFG_BUF, "config");
+}
+
+// ---------------------------------------------------------------------------
+// Inbound MQTT decoupling
+//
+// PubSubClient::loop() reassembles a whole incoming message (an ~11.6KB bridge
+// payload can take ~170ms over several TCP segments) and then calls mqttCallback
+// synchronously on whatever task ran loop(). Doing the heavy per-topic work
+// right there is what stalls the render loop. Split it: mqttCallback() only
+// copies the raw (topic,payload) into a PSRAM-backed message and pushes a
+// pointer onto a FreeRTOS queue; mqtt_process_inbound_queue() (called from the
+// main loop) drains it and runs the real processing, processMqttMessage(),
+// entirely on the loop task. All existing flash, LVGL and shared-state
+// access stays there. The worker only reads the socket, allocates one
+// PSRAM message and enqueues it; those application paths need no locks.
+// ---------------------------------------------------------------------------
+struct MqttInboundMsg {
+  char* topic;       // -> into the same backing allocation
+  uint8_t* payload;  // -> into the same backing allocation, or `external`
+  unsigned int length;
+  // A streamed message's own payload block (mqttStreamCallback), freed with
+  // the message; nullptr for every other message.
+  uint8_t* external;
+};
+
+static void mqttFreeInbound(MqttInboundMsg* msg) {
+  if (!msg) return;
+  if (msg->external) heap_caps_free(msg->external);
+  heap_caps_free(msg);
+}
+
+// A complete retained reconnect includes 46 dynamic topics plus Bridge
+// and Settings messages. A 16-entry queue filled during the measured
+// 1.3-second route reload and discarded media state. Messages live in
+// PSRAM; increasing only the queued pointers accommodates the burst
+// without significant SRAM use.
+static constexpr size_t kMqttInboundQueueDepth = 64;
+static QueueHandle_t g_mqtt_inbound_queue = nullptr;
+static MqttInboundMsg* g_deferred_bridge_apply = nullptr;
+
+static void processMqttMessage(char* topic, uint8_t* payload, unsigned int length);
+void media_browse_handle_catalog_message(const char* topic, const char* payload, size_t length);
+void media_browse_handle_status_message(const char* payload, size_t length);
+
+static QueueHandle_t mqttInboundQueue() {
+  if (!g_mqtt_inbound_queue) {
+    g_mqtt_inbound_queue = xQueueCreate(kMqttInboundQueueDepth, sizeof(MqttInboundMsg*));
+    if (!g_mqtt_inbound_queue) {
+      Serial.printf("[%s] Could not create inbound queue\n", networkManager.bridgeLogName());
+    }
+  }
+  return g_mqtt_inbound_queue;
+}
+
+bool mqttInboundBusy(uint32_t quiet_ms) {
+  if (g_mqtt_inbound_queue && uxQueueMessagesWaiting(g_mqtt_inbound_queue) > 0) return true;
+  const uint32_t last = g_last_inbound_ms;
+  return quiet_ms != 0 && last != 0 && millis() - last < quiet_ms;
+}
+
+// One allocation per message, laid out as [MqttInboundMsg][topic\0][payload].
+// PSRAM preferred (freed by the drainer after processMqttMessage()).
+static MqttInboundMsg* mqttAllocInbound(const char* topic,
+                                        const uint8_t* payload,
+                                        unsigned int length,
+                                        size_t packet_capacity,
+                                        bool* invalid_out) {
+  if (invalid_out) *invalid_out = false;
+
+  // The callback topic starts at most MQTT_MAX_HEADER_SIZE + 1 bytes into the
+  // PubSubClient buffer. Keep the bounded scan inside that buffer even if a
+  // future parser regression forgets the terminator.
+  const size_t topic_prefix_reserve = MQTT_MAX_HEADER_SIZE + 1U;
+  if (!topic || (!payload && length != 0) ||
+      packet_capacity <= topic_prefix_reserve) {
+    if (invalid_out) *invalid_out = true;
+    return nullptr;
+  }
+  const size_t topic_scan_limit = packet_capacity - topic_prefix_reserve;
+  const size_t topic_len = strnlen(topic, topic_scan_limit);
+  if (topic_len == 0 || topic_len == topic_scan_limit) {
+    if (invalid_out) *invalid_out = true;
+    return nullptr;
+  }
+
+  size_t total = 0;
+  if (!hometiles_mqtt::checkedInboundAllocationSize(
+          sizeof(MqttInboundMsg), topic_len, length, packet_capacity,
+          &total)) {
+    if (invalid_out) *invalid_out = true;
+    return nullptr;
+  }
+
+  uint8_t* block = static_cast<uint8_t*>(heap_caps_malloc(total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!block) block = static_cast<uint8_t*>(heap_caps_malloc(total, MALLOC_CAP_8BIT));
+  if (!block) return nullptr;
+  MqttInboundMsg* msg = reinterpret_cast<MqttInboundMsg*>(block);
+  msg->topic = reinterpret_cast<char*>(block + sizeof(MqttInboundMsg));
+  msg->payload = reinterpret_cast<uint8_t*>(msg->topic + topic_len + 1);
+  msg->length = length;
+  msg->external = nullptr;
+  if (topic_len) memcpy(msg->topic, topic, topic_len);
+  msg->topic[topic_len] = '\0';
+  if (length) memcpy(msg->payload, payload, length);
+  return msg;
+}
+
+void mqtt_process_inbound_queue(uint8_t max_msgs) {
+  QueueHandle_t q = g_mqtt_inbound_queue;  // do NOT lazily create here -- nothing to drain if never used
+  uint8_t processed = 0;
+
+  // A bridge/apply payload rebuilds several indexes and schedules hidden tile
+  // cache work. Keep MQTT receiving while the camera popup is visible, but
+  // retain only the newest full bridge snapshot in PSRAM and apply it after
+  // the popup closes. Normal sensor/switch/media messages continue below.
+  const bool camera_busy = camera_popup_is_busy();
+  if (!camera_busy && g_deferred_bridge_apply &&
+      (max_msgs == 0 || processed < max_msgs)) {
+    MqttInboundMsg* deferred = g_deferred_bridge_apply;
+    g_deferred_bridge_apply = nullptr;
+    Serial.printf(
+        "[Bridge] Applying deferred full synchronization after camera (%u bytes)\n",
+        deferred->length);
+    processMqttMessage(
+        deferred->topic, deferred->payload, deferred->length);
+    mqttFreeInbound(deferred);
+    ++processed;
+  }
+
+  if (!q) return;
+  // A drain that holds the loop this long is logged with its slowest message
+  // (V2 b301 boot: the loop stood still for 0.7 s twice after the Bridge link
+  // came up). Logging only.
+  constexpr uint32_t kSlowDrainMs = 300;
+  const uint32_t drain_started = millis();
+  uint32_t slowest_ms = 0;
+  uint32_t drained = 0;  // processed is 8 bits and wraps in an unlimited drain
+  char slowest_topic[96] = "";
+  MqttInboundMsg* msg = nullptr;
+  while ((max_msgs == 0 || processed < max_msgs) && xQueueReceive(q, &msg, 0) == pdTRUE) {
+    if (msg) {
+      const char* apply_topic = networkManager.getBridgeApplyTopic();
+      if (camera_busy && apply_topic &&
+          strcmp(msg->topic, apply_topic) == 0) {
+        if (g_deferred_bridge_apply) {
+          mqttFreeInbound(g_deferred_bridge_apply);
+        }
+        g_deferred_bridge_apply = msg;
+        Serial.printf(
+            "[Bridge] Full synchronization deferred while camera is active (%u bytes)\n",
+            msg->length);
+        msg = nullptr;
+        ++processed;
+        continue;
+      }
+      const uint32_t message_started = millis();
+      processMqttMessage(msg->topic, msg->payload, msg->length);
+      const uint32_t message_ms = millis() - message_started;
+      if (message_ms > slowest_ms) {
+        slowest_ms = message_ms;
+        strlcpy(slowest_topic, msg->topic, sizeof(slowest_topic));
+      }
+      mqttFreeInbound(msg);
+      ++processed;
+      ++drained;
+    }
+  }
+  const uint32_t drain_ms = millis() - drain_started;
+  if (drain_ms >= kSlowDrainMs) {
+    Serial.printf("[Inbound] Drained %u messages in %u ms; slowest %u ms: %s\n",
+                  static_cast<unsigned>(drained), static_cast<unsigned>(drain_ms),
+                  static_cast<unsigned>(slowest_ms), slowest_topic);
+  }
+}
+
+// ========== MQTT Callback (thin: enqueue only) ==========
+void mqttCallback(char* topic, uint8_t* payload, unsigned int length) {
+  // How much real time passed since the LVGL tick was last serviced, before we
+  // even get here. This is the pure socket-read / loop-cadence latency (the
+  // reassembly of a large multi-segment payload), independent of our own
+  // processing -- which now runs later, on the loop drainer.
+  uint32_t entry_since_tick = millis() - g_lvgl_tick_last_ms;
+  if (entry_since_tick >= 50) {
+    Serial.printf("[Bridge] Message callback entry: %ums since last LVGL tick service\n",
+                  (unsigned)entry_since_tick);
+  }
+
+  QueueHandle_t q = mqttInboundQueue();
+  g_last_inbound_ms = millis();
+  bool invalid = false;
+  const size_t packet_capacity = networkManager.getMqttBufferSize();
+  MqttInboundMsg* msg =
+      q ? mqttAllocInbound(topic, payload, length, packet_capacity, &invalid)
+        : nullptr;
+  if (invalid) {
+    static uint32_t invalid_drop_count = 0;
+    const uint32_t count = ++invalid_drop_count;
+    if (count == 1 || (count % 10U) == 0U) {
+      Serial.printf(
+          "[MQTT] Dropped invalid inbound packet: payload=%u, capacity=%u "
+          "(count=%u)\n",
+          static_cast<unsigned>(length),
+          static_cast<unsigned>(packet_capacity),
+          static_cast<unsigned>(count));
+    }
+    return;
+  }
+  if (!msg) {
+    g_inbound_dropped = true;
+    Serial.printf("[%s] Inbound allocation/queue unavailable; dropped '%s'\n", networkManager.bridgeLogName(),
+                  topic ? topic : "?");
+    return;
+  }
+  // mqttCallback runs on the owning MQTT worker. It must never fall back to
+  // inline processMqttMessage(), which touches flash and LVGL on the loop
+  // task. Briefly wait for a full queue to drain, then drop. Rate-limit
+  // drop logs because display sleep drains only about every 150 ms.
+  if (xQueueSend(q, &msg, pdMS_TO_TICKS(50)) != pdTRUE) {
+    mqttFreeInbound(msg);
+    g_inbound_dropped = true;
+    static uint32_t last_drop_log_ms = 0;
+    const uint32_t drop_now_ms = millis();
+    if (last_drop_log_ms == 0 || (uint32_t)(drop_now_ms - last_drop_log_ms) >= 5000) {
+      last_drop_log_ms = drop_now_ms;
+      Serial.printf("[%s] Inbound queue full -> message dropped (latest: %s)\n", networkManager.bridgeLogName(),
+                    topic ? topic : "?");
+    }
+  }
+}
+
+// A streamed message from the Bridge (link only, above the normal message
+// size). Only image topics may be this large: every other handler was built
+// for messages within the MQTT buffer. The payload keeps its own block.
+void mqttStreamCallback(const char* topic, uint8_t* data, size_t length) {
+  QueueHandle_t q = mqttInboundQueue();
+  const size_t topic_len = topic ? strnlen(topic, 256) : 0;
+  if (!q || !data || topic_len == 0 || topic_len >= 256 || !strstr(topic, "/image/")) {
+    Serial.printf("[%s] Streamed message dropped (%u bytes): %s\n", networkManager.bridgeLogName(),
+                  static_cast<unsigned>(length), topic ? topic : "?");
+    if (data) heap_caps_free(data);
+    return;
+  }
+  uint8_t* block = static_cast<uint8_t*>(
+      heap_caps_malloc(sizeof(MqttInboundMsg) + topic_len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!block) {
+    heap_caps_free(data);
+    Serial.printf("[%s] Inbound allocation unavailable; dropped '%s'\n", networkManager.bridgeLogName(), topic);
+    return;
+  }
+  MqttInboundMsg* msg = reinterpret_cast<MqttInboundMsg*>(block);
+  msg->topic = reinterpret_cast<char*>(block + sizeof(MqttInboundMsg));
+  memcpy(msg->topic, topic, topic_len + 1);
+  msg->payload = data;
+  msg->length = static_cast<unsigned int>(length);
+  msg->external = data;
+  g_last_inbound_ms = millis();
+  if (xQueueSend(q, &msg, pdMS_TO_TICKS(50)) != pdTRUE) {
+    mqttFreeInbound(msg);
+    Serial.printf("[%s] Inbound queue full -> streamed message dropped: %s\n", networkManager.bridgeLogName(), topic);
+  }
+}
+
+// ========== MQTT message processing (Topic-Routing, runs on the loop) ==========
+static void processMqttMessage(char* topic, uint8_t* payload, unsigned int length) {
+  yield();  // Let the web server run.
+
+  // Sealed Bridge messages, and while pairing is active the unencrypted
+  // copies of stream-token topics, never reach the plain handlers below.
+  if (command_channel::handleMqttMessage(topic, payload, length)) return;
+  if (command_channel::blocksPlaintext(topic)) return;
+  // Pictures from the Bridge (link only) never reach the state handlers.
+  if (bridge_images::handleMqttMessage(topic, payload, length)) return;
+
+  // Local relays use a small direct topic path, avoiding JSON parsing
+  // while normal Bridge and camera messages retain the established router.
+  if (hardwareIo.handleMqttMessage(topic, payload, length)) return;
+
+  if (viewNavigationHandleMessage(topic, reinterpret_cast<const char*>(payload), length)) return;
+  // Built-in camera snapshot requests only validate and wake the camera
+  // worker here; capture and upload never run on the loop task.
+  if (local_camera::handleMqttMessage(topic, payload, length)) return;
+  // Speaker and Assist commands only validate and hand a clip or a capture
+  // session to the audio worker.
+  if (speaker::handleMqttMessage(topic, payload, length)) return;
+  if (editable_handle_ack(topic, reinterpret_cast<const char*>(payload), length)) return;
+  const char* apply_topic = networkManager.getBridgeApplyTopic();
+  if (apply_topic && strcmp(topic, apply_topic) == 0) {
+    char* cfg_buf = mqttConfigBuffer();
+    if (!cfg_buf) return;
+    if (length >= CFG_BUF) {
+      Serial.printf("[Bridge] WARNING: Payload too large (%u bytes), truncating!\n", length);
+    }
+    size_t copy_len = length < CFG_BUF - 1 ? length : CFG_BUF - 1;
+    memcpy(cfg_buf, payload, copy_len);
+    cfg_buf[copy_len] = '\0';
+    yield();  // After the large copy.
+    Serial.printf("[Bridge] apply-topic hit (%u bytes)\n", (unsigned)copy_len);
+    bool reload = false;
+    bool icons_changed = false;
+    uint32_t t_parse0 = millis();
+    bool applied = haBridgeConfig.applyJson(cfg_buf, &reload, &icons_changed);
+    Serial.printf("[Bridge] applyJson: %u ms\n", (unsigned)(millis() - t_parse0));
+    if (applied) {
+      Serial.println("[Bridge] Configuration received from HA");
+      // applyJson replaces Bridge metadata and value maps. Restore panel-local
+      // I/O entities immediately so the tile editor and runtime cache retain
+      // them without depending on the Bridge.
+      hardwareIo.refreshLocalEntityCache();
+      // Only the first successful Bridge sync releases the boot sleep guard
+      // and starts the idle timer. Later periodic apply refreshes used to reset
+      // that timer repeatedly, preventing a 60-minute screensaver from starting.
+      if (!g_bridge_initial_sync_complete) {
+        g_bridge_initial_sync_complete = true;
+        powerManager.allowSleep();
+        displayManager.resetActivityTimer();
+        Serial.println("[Bridge] Initial sync: idle timer started once");
+      }
+      tiles_request_bridge_cache_refresh();
+      if (reload) {
+        yield();  // After JSON parsing.
+        // Do not announce the device again: HA answers each announcement with
+        // bridge/apply, so replying here creates an apply/announce feedback loop.
+        // Refresh dynamic topics after a quiet window and coalesce repeated reloads.
+        mqttRequestDynamicSlotsReload();
+        Serial.println("[Bridge] Dynamic subscriptions scheduled after the quiet period");
+      }
+      if (icons_changed) {
+        tiles_request_icon_refresh();
+        queue_sensor_popup_icon_refresh();
+      }
+      sync_local_device_entities(false);
+    } else {
+      Serial.println("[Bridge] Invalid bridge configuration received");
+    }
+    return;
+  }
+
+  const char* icons_topic = networkManager.getBridgeIconsTopic();
+  if (icons_topic && strcmp(topic, icons_topic) == 0) {
+    char* large_buf = mqttLargeBuffer();
+    if (!large_buf) return;
+    size_t copy_len = length < LARGE_BUF - 1 ? length : LARGE_BUF - 1;
+    memcpy(large_buf, payload, copy_len);
+    large_buf[copy_len] = '\0';
+    if (haBridgeConfig.applyIconUpdate(large_buf)) {
+      tiles_request_icon_refresh();
+      queue_sensor_popup_icon_refresh();
+      device_control::refresh_all();
+    }
+    return;
+  }
+
+  // The Media popup's library: catalog pages on {base}/stat/media/catalog,
+  // errors on {base}/stat/media (after memooox3's PR #87). Always through the
+  // large buffer.
+  {
+    const String& base = mqttTopics.deviceBase();
+    const size_t base_len = base.length();
+    static const char kMediaStat[] = "/stat/media";
+    if (base_len && strncmp(topic, base.c_str(), base_len) == 0 &&
+        strncmp(topic + base_len, kMediaStat, sizeof(kMediaStat) - 1) == 0) {
+      const char* rest = topic + base_len + sizeof(kMediaStat) - 1;
+      const bool is_status = *rest == '\0';
+      const bool is_catalog = strcmp(rest, "/catalog") == 0;
+      if (is_status || is_catalog) {
+        char* large_buf = mqttLargeBuffer();
+        if (!large_buf) return;
+        if (length >= LARGE_BUF) {
+          Serial.printf("[MediaLibrary] Answer too large (%u bytes), dropped\n", static_cast<unsigned>(length));
+          return;
+        }
+        memcpy(large_buf, payload, length);
+        large_buf[length] = '\0';
+        if (is_catalog) media_browse_handle_catalog_message(topic, large_buf, length);
+        else media_browse_handle_status_message(large_buf, length);
+        return;
+      }
+    }
+  }
+
+  bool processed_static = false;
+  for (const auto& route : kRoutes) {
+    const char* expected = mqttTopics.topic(route.key);
+    if (!expected || strcmp(topic, expected) != 0) {
+      continue;
+    }
+
+    char* buf = route.use_large_buffer ? mqttLargeBuffer() : small_buf;
+    if (!buf) return;
+    size_t buf_len = route.use_large_buffer ? LARGE_BUF : sizeof(small_buf);
+    size_t copy_len = length < (buf_len - 1) ? length : (buf_len - 1);
+    memcpy(buf, payload, copy_len);
+    buf[copy_len] = '\0';
+
+    route.handler(buf, copy_len);
+    processed_static = true;
+    break;
+  }
+
+  if (processed_static) {
+    return;
+  }
+
+  // Check dynamic sensor routes; larger JSON may require the large buffer.
+  char* dyn_buf = (length < SMALL_BUF) ? small_buf : mqttLargeBuffer();
+  if (!dyn_buf) return;
+  size_t dyn_len = (length < SMALL_BUF) ? sizeof(small_buf) : LARGE_BUF;
+  size_t copy_len = length < (dyn_len - 1) ? length : (dyn_len - 1);
+  memcpy(dyn_buf, payload, copy_len);
+  dyn_buf[copy_len] = '\0';
+  if (tryHandleDynamicSensor(topic, dyn_buf, copy_len)) {
+    yield();  // After the sensor update.
+    return;
+  }
+  if (tryHandleDynamicWeather(topic, dyn_buf)) {
+    yield();
+    return;
+  }
+
+  const char* history_topic = networkManager.getHistoryResponseTopic();
+  if (history_topic && strcmp(topic, history_topic) == 0) {
+    char* large_buf = mqttLargeBuffer();
+    if (!large_buf) return;
+    size_t copy_len = length < (LARGE_BUF - 1) ? length : (LARGE_BUF - 1);
+    memcpy(large_buf, payload, copy_len);
+    large_buf[copy_len] = '\0';
+    String response_entity;
+    const bool has_entity =
+        extract_json_string_field(large_buf, "entity_id", response_entity) &&
+        response_entity.length();
+    String response_kind;
+    extract_json_string_field(large_buf, "kind", response_kind);
+    const bool is_binary = response_kind.equalsIgnoreCase("binary");
+    const bool is_state = response_kind.equalsIgnoreCase("state");
+    const bool is_discrete = is_binary || is_state;
+    // The range and how long its answer took (user 2026-10-14: 7 days felt
+    // slow; the log showed neither).
+    uint16_t answer_hours = 0;
+    uint32_t answer_wait_ms = 0;
+    if (has_entity) {
+      if (is_discrete) {
+        uint16_t response_hours = 0;
+        extract_json_uint16_field(large_buf, "hours", response_hours);
+        clear_pending_discrete_history_request(
+            response_entity.c_str(), response_kind.c_str(), response_hours);
+        if (is_state) {
+          // A new Bridge may upgrade a legacy numeric request after inspecting
+          // the entity metadata. Clear that old pending slot as well.
+          clear_pending_history_request(response_entity.c_str());
+        }
+      } else {
+        // Keep it for a replay only when the answer is for the range still
+        // pending: a fast second switch replaces the pending range first.
+        uint16_t response_hours = 0;
+        uint16_t response_period = 0;
+        const PendingHistoryRequest* request =
+            find_pending_history_request(response_entity.c_str());
+        if (request) {
+          answer_hours = request->hours;
+          answer_wait_ms = millis() - request->requested_at_ms;
+        }
+        if (request &&
+            extract_json_uint16_field(large_buf, "hours", response_hours) &&
+            extract_json_uint16_field(large_buf, "period_minutes", response_period) &&
+            response_hours == request->hours &&
+            response_period == request->period_minutes) {
+          store_history_replay(*request, large_buf, copy_len);
+        }
+        clear_pending_history_request(response_entity.c_str());
+      }
+    }
+    char answer_time[48] = "";
+    if (answer_hours) {
+      snprintf(answer_time, sizeof(answer_time), ", %u h, %lu ms after the request",
+               static_cast<unsigned>(answer_hours), static_cast<unsigned long>(answer_wait_ms));
+    }
+    Serial.printf("[%s] Response received: %s, %u bytes%s\n",
+                  is_binary ? "BinaryHistory"
+                            : (is_state ? "StateHistory" : "History"),
+                  response_entity.length() ? response_entity.c_str()
+                                           : "unknown entity",
+                  static_cast<unsigned>(copy_len), answer_time);
+    queue_sensor_popup_history(nullptr, large_buf, copy_len);
+    if (!is_discrete) {
+      queue_tile_graph_history(nullptr, large_buf, copy_len);
+    }
+    return;
+  }
+
+  const char* energy_topic = networkManager.getEnergyResponseTopic();
+  if (energy_topic && strcmp(topic, energy_topic) == 0) {
+    char* large_buf = mqttLargeBuffer();
+    if (!large_buf) return;
+    size_t copy_len = length < (LARGE_BUF - 1) ? length : (LARGE_BUF - 1);
+    memcpy(large_buf, payload, copy_len);
+    large_buf[copy_len] = '\0';
+    queue_energy_response(large_buf, copy_len);
+    return;
+  }
+
+  Serial.printf("[%s] Unhandled topic %s\n", networkManager.bridgeLogName(), topic);
+}
+
+// ========== Subscribe to topics ==========
+void mqttSubscribeTopics() {
+  unsigned queued = 0;
+  if (networkManager.mqttEnqueueSubscribe((mqttTopics.deviceBase() + "/stat/value").c_str())) {
+    ++queued;
+  }
+  // The Media popup's library answers. Fixed topics: the direct link takes
+  // no wildcard subscription (Bridge link_protocol.valid_topic).
+  for (const char* leaf : {"/stat/media/catalog", "/stat/media"}) {
+    if (networkManager.mqttEnqueueSubscribe((mqttTopics.deviceBase() + leaf).c_str())) ++queued;
+  }
+  for (const auto& route : kRoutes) {
+    const char* tpc = mqttTopics.topic(route.key);
+    if (!tpc || !*tpc) continue;
+    if (networkManager.mqttEnqueueSubscribe(tpc)) ++queued;
+  }
+  // Explicit, capability-gated subscription: profiles without the built-in
+  // camera never subscribe to {base}/cmnd/local_camera.
+  if (const char* camera_topic = local_camera::commandTopic()) {
+    if (networkManager.mqttEnqueueSubscribe(camera_topic)) ++queued;
+  }
+  // Same for {base}/cmnd/audio on profiles without a speaker.
+  if (const char* audio_topic = speaker::commandTopic()) {
+    if (networkManager.mqttEnqueueSubscribe(audio_topic)) ++queued;
+  }
+  // And {base}/cmnd/assist (microphone capture for Home Assistant Assist).
+  if (const char* assist_topic = speaker::assistCommandTopic()) {
+    if (networkManager.mqttEnqueueSubscribe(assist_topic)) ++queued;
+  }
+  Serial.printf("[%s] %u fixed subscriptions queued\n", networkManager.bridgeLogName(), queued);
+
+  // After MQTT reconnects, the broker has no subscriptions for this session.
+  // Subscribe to every existing route once without first queueing pointless
+  // unsubscribe commands.
+  mqttReloadDynamicSlots(true);
+  hardwareIo.subscribeMqttTopics();
+  if (g_live_picture_topic.length() && networkManager.linkConfigured()) {
+    networkManager.mqttEnqueueSubscribe(g_live_picture_topic.c_str());
+  }
+  if (networkManager.linkConfigured()) {
+    for (const String& topic : g_tile_picture_topics) networkManager.mqttEnqueueSubscribe(topic.c_str());
+  }
+}
+
+// ========== Publish home snapshot ==========
+void mqttPublishHomeSnapshot() {
+  if (!networkManager.isMqttConnected()) return;
+
+  char buf[24];
+  dtostrf(g_outside_c, 0, 1, buf);
+  networkManager.mqttEnqueuePublish(mqttTopics.topic(TopicKey::SENSOR_OUT), buf, true);
+
+  dtostrf(g_inside_c, 0, 1, buf);
+  networkManager.mqttEnqueuePublish(mqttTopics.topic(TopicKey::SENSOR_IN), buf, true);
+
+  if (batteryStateSupportsMeasurement()) {
+    const int soc = readBatterySocPercent();
+    if (batteryStateHasDisplayPercent()) snprintf(buf, sizeof(buf), "%d", soc);
+    else snprintf(buf, sizeof(buf), "unavailable");
+    networkManager.mqttEnqueuePublish(mqttTopics.topic(TopicKey::SENSOR_SOC), buf, true);
+  } else {
+    // Remove the old retained synthetic zero rather than publishing false data.
+    networkManager.mqttEnqueuePublish(mqttTopics.topic(TopicKey::SENSOR_SOC), "", true);
+  }
+}
+
+// ========== Publish device settings ==========
+void mqttPublishDeviceSettings() {
+  sync_local_device_entities(false);
+  if (!networkManager.isMqttConnected()) return;
+
+  const DeviceConfig& cfg = configManager.getConfig();
+
+  auto publish_state = [&](TopicKey key, const char* payload) {
+    const char* tpc = mqttTopics.topic(key);
+    if (!tpc || !*tpc || !payload) return;
+    networkManager.mqttEnqueuePublish(tpc, payload, true);
+  };
+
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d",
+           brightnessPctFromRaw(static_cast<int>(cfg.display_brightness)));
+  publish_state(TopicKey::DISPLAY_BRIGHTNESS_STAT, buf);
+  snprintf(buf, sizeof(buf), "%u",
+           static_cast<unsigned>(cfg.screensaver_brightness_pct));
+  publish_state(TopicKey::SCREENSAVER_BRIGHTNESS_STAT, buf);
+  publish_state(TopicKey::DISPLAY_ROTATE_STAT, cfg.display_rotated_180 ? "ON" : "OFF");
+  // The rotation select's value and the steps this panel offers.
+  char rotation[64];
+  snprintf(rotation, sizeof(rotation), "{\"degrees\":%d,\"options\":%s}", display_rotation_degrees(cfg),
+           Device::supportsQuarterTurnRotation() ? "[0,90,180,270]" : "[0,180]");
+  publish_state(TopicKey::DISPLAY_ROTATION_STAT, rotation);
+  publish_state(TopicKey::DISPLAY_THEME_STAT, display_theme_id(cfg.theme));
+  publish_state(TopicKey::DISPLAY_SLEEP_STAT, powerManager.isInSleep() ? "ON" : "OFF");
+
+  publish_state(TopicKey::SLEEP_MAINS_STAT,
+                sleepLabelFromConfig(cfg.auto_sleep_enabled, cfg.auto_sleep_seconds));
+  publish_state(TopicKey::SLEEP_BAT_STAT,
+                sleepLabelFromConfig(cfg.auto_sleep_battery_enabled, cfg.auto_sleep_battery_seconds));
+}
+
+void mqttServiceLocalSensors() {
+  service_pending_history_fallback();
+  // Advance one due 1-Wire phase per call; the relay-only path is cheap.
+  // The state machine never waits synchronously for DS18x20 conversion.
+  hardwareIo.service();
+
+  static uint32_t last_run_ms = 0;
+  const uint32_t now_ms = millis();
+  if (last_run_ms != 0 && (int32_t)(now_ms - last_run_ms) < 500) {
+    return;
+  }
+  last_run_ms = now_ms;
+  sync_internal_battery_entity();
+
+}
+
+// ========== Publish scene command ==========
+void mqttPublishScene(const char* scene_name) {
+  if (!scene_name || !*scene_name) return;
+  const String entity = haBridgeConfig.findSceneEntity(scene_name);
+  if (entity.length() && !ha_control::supportsSceneTile(entity.c_str())) return;
+
+  if (!networkManager.isMqttConnected()) {
+    Serial.printf("Scene command skipped (offline): %s\n", scene_name);
+    return;
+  }
+
+  bool queued = networkManager.mqttEnqueuePublish(mqttTopics.topic(TopicKey::SCENE_CMND), scene_name, false);
+  Serial.printf("Scene command -> '%s' (%s)\n", scene_name, queued ? "queued" : "queue-full");
+}
+
+// ========== Publish light/switch command ==========
+void mqttPublishSwitchCommand(const char* entity_id, const char* state) {
+  if (!entity_id || !*entity_id) return;
+  if (handle_local_switch_command(entity_id, state)) return;
+  if (!ha_control::supportsSwitchTile(entity_id)) return;
+
+  if (!networkManager.isMqttConnected()) {
+    Serial.printf("Switch command skipped (offline): %s\n", entity_id);
+    return;
+  }
+
+  const char* action = (state && *state) ? state : "toggle";
+  const char* topic = nullptr;
+  if (strncmp(entity_id, "light.", 6) == 0) {
+    topic = mqttTopics.topic(TopicKey::LIGHT_CMND);
+  } else {
+    topic = mqttTopics.topic(TopicKey::SWITCH_CMND);
+  }
+
+  if (!topic || !*topic) {
+    Serial.printf("Switch command skipped (no topic): %s\n", entity_id);
+    return;
+  }
+
+  char payload[256];
+  snprintf(payload, sizeof(payload), "{\"entity_id\":\"%s\",\"state\":\"%s\"}", entity_id, action);
+  bool queued = networkManager.mqttEnqueuePublish(topic, payload, false);
+  Serial.printf("Switch command -> '%s' (%s)\n", topic, queued ? "queued" : "queue-full");
+}
+
+void mqttPublishMediaCommand(const char* entity_id, const char* command) {
+  if (!entity_id || !*entity_id) return;
+
+  if (!networkManager.isMqttConnected()) {
+    Serial.printf("Media command skipped (offline): %s\n", entity_id);
+    return;
+  }
+
+  const char* topic = mqttTopics.topic(TopicKey::MEDIA_CMND);
+  if (!topic || !*topic) {
+    Serial.printf("Media command skipped (no topic): %s\n", entity_id);
+    return;
+  }
+
+  const char* action = (command && *command) ? command : "play_pause";
+  char payload[256];
+  snprintf(payload, sizeof(payload), "{\"entity_id\":\"%s\",\"command\":\"%s\"}", entity_id, action);
+  bool queued = networkManager.mqttEnqueuePublishPriority(topic, payload, false);
+  Serial.printf("Media command -> '%s' (%s, priority)\n",
+                topic, queued ? "queued" : "queue-full");
+}
+
+void mqttPublishMediaSeek(const char* entity_id, float position_seconds) {
+  if (!entity_id || !*entity_id) return;
+  if (position_seconds < 0.0f) position_seconds = 0.0f;
+
+  if (!networkManager.isMqttConnected()) {
+    Serial.printf("Media seek skipped (offline): %s\n", entity_id);
+    return;
+  }
+
+  const char* topic = mqttTopics.topic(TopicKey::MEDIA_CMND);
+  if (!topic || !*topic) {
+    Serial.printf("Media seek skipped (no topic): %s\n", entity_id);
+    return;
+  }
+
+  char payload[288];
+  snprintf(payload,
+           sizeof(payload),
+           "{\"entity_id\":\"%s\",\"command\":\"media_seek\",\"seek_position\":%.1f}",
+           entity_id,
+           position_seconds);
+  bool queued = networkManager.mqttEnqueuePublishPriority(topic, payload, false);
+  Serial.printf("Media seek -> '%s' %.1fs (%s, priority)\n",
+                topic,
+                position_seconds,
+                queued ? "queued" : "queue-full");
+}
+
+void mqttPublishMediaVolume(const char* entity_id, float volume_level) {
+  if (!entity_id || !*entity_id) return;
+  if (volume_level < 0.0f) volume_level = 0.0f;
+  if (volume_level > 1.0f) volume_level = 1.0f;
+
+  if (!networkManager.isMqttConnected()) {
+    Serial.printf("Media volume skipped (offline): %s\n", entity_id);
+    return;
+  }
+
+  const char* topic = mqttTopics.topic(TopicKey::MEDIA_CMND);
+  if (!topic || !*topic) {
+    Serial.printf("Media volume skipped (no topic): %s\n", entity_id);
+    return;
+  }
+
+  char payload[288];
+  snprintf(payload,
+           sizeof(payload),
+           "{\"entity_id\":\"%s\",\"command\":\"volume_set\",\"volume_level\":%.3f}",
+           entity_id,
+           volume_level);
+  bool queued = networkManager.mqttEnqueuePublishPriority(topic, payload, false);
+  Serial.printf("Media volume -> '%s' %.0f%% (%s, priority)\n",
+                topic, volume_level * 100.0f,
+                queued ? "queued" : "queue-full");
+}
+
+void mqttPublishMediaMute(const char* entity_id, bool muted) {
+  if (!entity_id || !*entity_id) return;
+
+  if (!networkManager.isMqttConnected()) {
+    Serial.printf("Media mute skipped (offline): %s\n", entity_id);
+    return;
+  }
+
+  const char* topic = mqttTopics.topic(TopicKey::MEDIA_CMND);
+  if (!topic || !*topic) {
+    Serial.printf("Media mute skipped (no topic): %s\n", entity_id);
+    return;
+  }
+
+  char payload[288];
+  snprintf(payload,
+           sizeof(payload),
+           "{\"entity_id\":\"%s\",\"command\":\"volume_mute\",\"is_volume_muted\":%s}",
+           entity_id,
+           muted ? "true" : "false");
+  bool queued = networkManager.mqttEnqueuePublishPriority(topic, payload, false);
+  Serial.printf("Media mute -> '%s' %s (%s, priority)\n",
+                topic, muted ? "on" : "off",
+                queued ? "queued" : "queue-full");
+}
+
+// Appends value as a JSON string literal (quotes included): sources, sound
+// modes and media content ids are free text from Home Assistant.
+static void append_json_string(String& out, const char* value) {
+  out += '"';
+  for (const char* p = value ? value : ""; *p; ++p) {
+    const unsigned char c = static_cast<unsigned char>(*p);
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (c < 0x20) {
+          char esc[8];
+          snprintf(esc, sizeof(esc), "\\u%04x", c);
+          out += esc;
+        } else {
+          out += static_cast<char>(c);
+        }
+    }
+  }
+  out += '"';
+}
+
+// One media command with its fields (already JSON, starting with a comma or
+// empty) on the priority lane: a tap the user waits for.
+static bool publish_media_json(const char* entity_id, const char* command, const String& fields,
+                               bool large_answer = false) {
+  if (!entity_id || !*entity_id || !networkManager.isMqttConnected()) return false;
+  const char* topic = mqttTopics.topic(TopicKey::MEDIA_CMND);
+  if (!topic || !*topic) return false;
+  String payload;
+  payload.reserve(96 + fields.length());
+  payload += "{\"entity_id\":";
+  append_json_string(payload, entity_id);
+  payload += ",\"command\":";
+  append_json_string(payload, command);
+  payload += fields;
+  payload += '}';
+  // A library page can exceed the normal receive buffer: hold the large one
+  // while its answer is expected (like the history requests).
+  const bool queued = large_answer
+                          ? networkManager.mqttEnqueuePublishWithLargeBuffer(topic, payload.c_str(), false, 15000, true)
+                          : networkManager.mqttEnqueuePublishPriority(topic, payload.c_str(), false);
+  Serial.printf("Media %s -> '%s' (%s)\n", command, entity_id, queued ? "queued" : "queue-full");
+  return queued;
+}
+
+bool mqttPublishMediaShuffle(const char* entity_id, bool shuffle) {
+  return publish_media_json(entity_id, "shuffle_set", shuffle ? ",\"shuffle\":true" : ",\"shuffle\":false");
+}
+
+bool mqttPublishMediaRepeat(const char* entity_id, const char* mode) {
+  String fields = ",\"repeat\":";
+  append_json_string(fields, mode);
+  return publish_media_json(entity_id, "repeat_set", fields);
+}
+
+bool mqttPublishMediaSelect(const char* entity_id, bool sound_mode, const char* value) {
+  String fields = sound_mode ? ",\"sound_mode\":" : ",\"source\":";
+  append_json_string(fields, value);
+  return publish_media_json(entity_id, sound_mode ? "select_sound_mode" : "select_source", fields);
+}
+
+bool mqttPublishMediaGroup(const char* entity_id, bool join, const char* member) {
+  String fields;
+  if (join) {
+    fields = ",\"group_members\":[";
+    append_json_string(fields, member);
+    fields += ']';
+  } else {
+    fields = ",\"member\":";
+    append_json_string(fields, member);
+  }
+  return publish_media_json(entity_id, join ? "join" : "unjoin", fields);
+}
+
+bool mqttPublishMediaBrowse(const char* entity_id, const char* session, uint32_t request_id,
+                            const char* media_content_id, const char* media_content_type) {
+  String fields = ",\"session\":";
+  append_json_string(fields, session);
+  fields += ",\"request_id\":";
+  fields += String(request_id);
+  fields += ",\"media_content_id\":";
+  append_json_string(fields, media_content_id);
+  fields += ",\"media_content_type\":";
+  append_json_string(fields, media_content_type);
+  return publish_media_json(entity_id, "browse_media", fields, true);
+}
+
+bool mqttPublishMediaPlay(const char* entity_id, const char* media_content_id, const char* media_content_type) {
+  if (!media_content_id || !*media_content_id || !media_content_type || !*media_content_type) return false;
+  String fields = ",\"media_content_id\":";
+  append_json_string(fields, media_content_id);
+  fields += ",\"media_content_type\":";
+  append_json_string(fields, media_content_type);
+  return publish_media_json(entity_id, "play_media", fields);
+}
+
+void mqttPublishClimateTemperature(const char* entity_id,
+                                   float temperature,
+                                   bool use_range,
+                                   float target_low,
+                                   float target_high) {
+  if (!entity_id || !*entity_id) return;
+  if (!networkManager.isMqttConnected()) {
+    Serial.printf("Climate temperature skipped (offline): %s\n", entity_id);
+    return;
+  }
+  const char* topic = mqttTopics.topic(TopicKey::CLIMATE_CMND);
+  if (!topic || !*topic) return;
+
+  char payload[320];
+  if (use_range) {
+    snprintf(payload, sizeof(payload),
+             "{\"entity_id\":\"%s\",\"command\":\"set_temperature\","
+             "\"target_temp_low\":%.2f,\"target_temp_high\":%.2f}",
+             entity_id, target_low, target_high);
+  } else {
+    snprintf(payload, sizeof(payload),
+             "{\"entity_id\":\"%s\",\"command\":\"set_temperature\","
+             "\"temperature\":%.2f}",
+             entity_id, temperature);
+  }
+  const bool queued =
+      networkManager.mqttEnqueuePublishPriority(topic, payload, false);
+  Serial.printf("Climate temperature -> '%s' (%s, priority)\n",
+                topic, queued ? "queued" : "queue-full");
+}
+
+void mqttPublishClimateHumidity(const char* entity_id, float humidity) {
+  if (!entity_id || !*entity_id) return;
+  if (!networkManager.isMqttConnected()) {
+    Serial.printf("Climate humidity skipped (offline): %s\n", entity_id);
+    return;
+  }
+  const char* topic = mqttTopics.topic(TopicKey::CLIMATE_CMND);
+  if (!topic || !*topic) return;
+
+  char payload[256];
+  snprintf(payload, sizeof(payload),
+           "{\"entity_id\":\"%s\",\"command\":\"set_humidity\","
+           "\"humidity\":%.1f}",
+           entity_id, humidity);
+  const bool queued =
+      networkManager.mqttEnqueuePublishPriority(topic, payload, false);
+  Serial.printf("Climate humidity -> '%s' (%s, priority)\n",
+                topic, queued ? "queued" : "queue-full");
+}
+
+void mqttPublishClimateHvacMode(const char* entity_id, const char* hvac_mode) {
+  if (!entity_id || !*entity_id || !hvac_mode || !*hvac_mode) return;
+  if (!networkManager.isMqttConnected()) {
+    Serial.printf("Climate mode skipped (offline): %s\n", entity_id);
+    return;
+  }
+  const char* topic = mqttTopics.topic(TopicKey::CLIMATE_CMND);
+  if (!topic || !*topic) return;
+
+  char payload[256];
+  snprintf(payload, sizeof(payload),
+           "{\"entity_id\":\"%s\",\"command\":\"set_hvac_mode\","
+           "\"hvac_mode\":\"%s\"}",
+           entity_id, hvac_mode);
+  const bool queued =
+      networkManager.mqttEnqueuePublishPriority(topic, payload, false);
+  Serial.printf("Climate mode -> '%s' (%s, priority)\n",
+                topic, queued ? "queued" : "queue-full");
+}
+
+void mqttPublishClimatePresetMode(
+    const char* entity_id, const char* preset_mode) {
+  if (!entity_id || !*entity_id || !preset_mode || !*preset_mode) return;
+  if (!networkManager.isMqttConnected()) {
+    Serial.printf("Climate preset skipped (offline): %s\n", entity_id);
+    return;
+  }
+  const char* topic = mqttTopics.topic(TopicKey::CLIMATE_CMND);
+  if (!topic || !*topic) return;
+
+  char payload[272];
+  snprintf(payload, sizeof(payload),
+           "{\"entity_id\":\"%s\",\"command\":\"set_preset_mode\","
+           "\"preset_mode\":\"%s\"}",
+           entity_id, preset_mode);
+  const bool queued =
+      networkManager.mqttEnqueuePublishPriority(topic, payload, false);
+  Serial.printf("Climate preset -> '%s' (%s, priority)\n",
+                topic, queued ? "queued" : "queue-full");
+}
+
+static void mqtt_publish_climate_option(
+    const char* entity_id,
+    const char* command,
+    const char* field,
+    const char* value,
+    const char* log_name) {
+  if (!entity_id || !*entity_id || !command || !*command ||
+      !field || !*field || !value || !*value) {
+    return;
+  }
+  if (!networkManager.isMqttConnected()) {
+    Serial.printf("Climate %s skipped (offline): %s\n",
+                  log_name, entity_id);
+    return;
+  }
+  const char* topic = mqttTopics.topic(TopicKey::CLIMATE_CMND);
+  if (!topic || !*topic) return;
+
+  char payload[304];
+  snprintf(payload, sizeof(payload),
+           "{\"entity_id\":\"%s\",\"command\":\"%s\",\"%s\":\"%s\"}",
+           entity_id, command, field, value);
+  const bool queued =
+      networkManager.mqttEnqueuePublishPriority(topic, payload, false);
+  Serial.printf("Climate %s -> '%s' (%s, priority)\n",
+                log_name, topic, queued ? "queued" : "queue-full");
+}
+
+void mqttPublishClimateFanMode(
+    const char* entity_id, const char* fan_mode) {
+  mqtt_publish_climate_option(
+      entity_id, "set_fan_mode", "fan_mode", fan_mode, "fan");
+}
+
+void mqttPublishClimateSwingMode(
+    const char* entity_id, const char* swing_mode) {
+  mqtt_publish_climate_option(
+      entity_id, "set_swing_mode", "swing_mode", swing_mode, "swing");
+}
+
+void mqttPublishClimateHorizontalSwingMode(
+    const char* entity_id, const char* swing_mode) {
+  mqtt_publish_climate_option(
+      entity_id, "set_swing_horizontal_mode",
+      "swing_horizontal_mode", swing_mode, "horizontal swing");
+}
+
+void mqttPublishCoverCommand(const char* entity_id,
+                             const char* command,
+                             int position) {
+  if (!entity_id || !*entity_id || !command || !*command) return;
+
+  static const char* const kCommands[] = {
+      "open_cover", "close_cover", "stop_cover", "set_cover_position",
+      "open_cover_tilt", "close_cover_tilt", "stop_cover_tilt",
+      "set_cover_tilt_position", "toggle", "toggle_cover_tilt"};
+  bool supported_command = false;
+  for (const char* allowed : kCommands) {
+    if (strcmp(command, allowed) == 0) {
+      supported_command = true;
+      break;
+    }
+  }
+  if (!supported_command) {
+    Serial.printf("Cover command rejected: %s\n", command);
+    return;
+  }
+  if (!networkManager.isMqttConnected()) {
+    Serial.printf("Cover command skipped (offline): %s\n", entity_id);
+    return;
+  }
+
+  const char* topic = mqttTopics.topic(TopicKey::COVER_CMND);
+  if (!topic || !*topic) return;
+  if (position < 0) position = 0;
+  if (position > 100) position = 100;
+
+  char payload[384];
+  int written = 0;
+  if (strcmp(command, "set_cover_position") == 0) {
+    written = snprintf(
+        payload, sizeof(payload),
+        "{\"entity_id\":\"%s\",\"command\":\"%s\",\"position\":%d}",
+        entity_id, command, position);
+  } else if (strcmp(command, "set_cover_tilt_position") == 0) {
+    written = snprintf(
+        payload, sizeof(payload),
+        "{\"entity_id\":\"%s\",\"command\":\"%s\",\"tilt_position\":%d}",
+        entity_id, command, position);
+  } else {
+    written = snprintf(
+        payload, sizeof(payload),
+        "{\"entity_id\":\"%s\",\"command\":\"%s\"}",
+        entity_id, command);
+  }
+  if (written < 0 || static_cast<size_t>(written) >= sizeof(payload)) {
+    Serial.printf("Cover command rejected (payload too long): %s\n", entity_id);
+    return;
+  }
+  const bool queued =
+      networkManager.mqttEnqueuePublishPriority(topic, payload, false);
+  Serial.printf("Cover command -> '%s' command=%s (%s, priority)\n",
+                topic, command, queued ? "queued" : "queue-full");
+}
+
+void mqttPublishLightCommand(const char* entity_id,
+                             const char* state,
+                             int brightness_pct,
+                             bool has_color,
+                             uint32_t color,
+                             int color_temp_kelvin) {
+  if (!entity_id || !*entity_id) return;
+  if (handle_local_light_command(entity_id, state, brightness_pct)) return;
+
+  if (!networkManager.isMqttConnected()) {
+    Serial.printf("Light command skipped (offline): %s\n", entity_id);
+    return;
+  }
+
+  const char* topic = mqttTopics.topic(TopicKey::LIGHT_CMND);
+  if (!topic || !*topic) {
+    Serial.printf("Light command skipped (no topic): %s\n", entity_id);
+    return;
+  }
+
+  String payload = "{\"entity_id\":\"";
+  payload += entity_id;
+  payload += "\"";
+
+  if (state && *state) {
+    payload += ",\"state\":\"";
+    payload += state;
+    payload += "\"";
+  }
+
+  if (brightness_pct >= 0) {
+    if (brightness_pct > 100) brightness_pct = 100;
+    payload += ",\"brightness_pct\":";
+    payload += brightness_pct;
+  }
+
+  if (has_color) {
+    uint8_t r = (color >> 16) & 0xFF;
+    uint8_t g = (color >> 8) & 0xFF;
+    uint8_t b = color & 0xFF;
+    payload += ",\"rgb_color\":[";
+    payload += r;
+    payload += ",";
+    payload += g;
+    payload += ",";
+    payload += b;
+    payload += "]";
+  }
+
+  if (color_temp_kelvin > 0) {
+    payload += ",\"color_temp_kelvin\":";
+    payload += color_temp_kelvin;
+  }
+
+  payload += "}";
+
+  bool queued = networkManager.mqttEnqueuePublish(topic, payload.c_str(), false);
+  Serial.printf("Light command -> '%s' (%s)\n", topic, queued ? "queued" : "queue-full");
+}
+
+static void normalize_history_range(uint16_t& hours, uint16_t& period_minutes, uint16_t& points) {
+  if (hours == 0) hours = 24;
+  if (period_minutes == 0) period_minutes = 5;
+  if (points == 0) {
+    points = static_cast<uint16_t>((static_cast<uint32_t>(hours) * 60U) / period_minutes);
+  }
+  if (points == 0) points = 1;
+}
+
+// Sends a numeric history request ahead of the queued commands and marks it
+// pending; false when the queue is full.
+static bool send_history_request(const char* history_topic, const char* entity_id, uint16_t hours,
+                                 uint16_t period_minutes, uint16_t points) {
+  String payload = "{\"entity_id\":\"";
+  payload += entity_id;
+  payload += "\",\"hours\":";
+  payload += String(hours);
+  payload += ",\"period_minutes\":";
+  payload += String(period_minutes);
+  payload += ",\"points\":";
+  payload += String(points);
+  payload += ",\"stat\":\"mean\"}";
+  // The user is waiting for this graph. A route reload can leave many
+  // safely paced subscribe commands ahead of the history request. Appending
+  // it behind that burst would let the 2-second fallback empty the graph
+  // before the request was even sent.
+  bool ok = networkManager.mqttEnqueuePublishWithLargeBuffer(
+      history_topic, payload.c_str(), false, 20000, true);
+  Serial.printf("History request -> '%s' (%s, priority)\n",
+                history_topic, ok ? "queued" : "queue-full");
+  if (ok) mark_pending_history_request(entity_id, millis(), hours, period_minutes, points);
+  return ok;
+}
+
+void mqttPublishHistoryRequest(const char* entity_id,
+                               uint16_t hours,
+                               uint16_t period_minutes,
+                               uint16_t points) {
+  if (!entity_id || !*entity_id) return;
+  // Local live values are available without the Bridge, but history is not.
+  // Do not start unnecessary HA history requests for panel I/O.
+  if (hardwareIo.isLocalEntityId(entity_id)) return;
+
+  normalize_history_range(hours, period_minutes, points);
+
+  const bool mqtt_online = networkManager.isMqttConnected();
+  const char* history_topic = networkManager.getHistoryRequestTopic();
+  const bool can_request_ha = mqtt_online && history_topic && *history_topic;
+  const bool time_valid = has_valid_local_time_for_history();
+
+  if (can_request_ha && replay_history_response(entity_id, hours, period_minutes, points)) {
+    clear_pending_history_request(entity_id);
+    return;
+  }
+
+  // Already asked (the finger on the tile asked first,
+  // mqttPrefetchHistoryRequest): its answer comes to the popup and the tile
+  // graphs like this one's would; asked again, a second answer came and was
+  // applied once more.
+  if (can_request_ha && history_request_on_its_way(entity_id, hours, period_minutes, points)) {
+    Serial.printf("[History] Request for %s already on its way\n", entity_id);
+    return;
+  }
+
+  // Discard previous pending entries for the same entity.
+  clear_pending_history_request(entity_id);
+
+  // Prefer HA history when HA is reachable.
+  if (can_request_ha) {
+    if (!time_valid && is_internal_tab5_entity(entity_id)) {
+      Serial.printf("[History] Local time invalid, requesting HA history for %s\n", entity_id);
+    }
+    if (send_history_request(history_topic, entity_id, hours, period_minutes, points)) return;
+    queue_history_fallback_for_entity(entity_id, time_valid, "HA publish failed",
+                                      hours, period_minutes, points);
+    return;
+  }
+
+  if (queue_history_fallback_for_entity(entity_id, time_valid, "HA unavailable",
+                                        hours, period_minutes, points)) {
+    return;
+  }
+
+  if (!mqtt_online) {
+    Serial.printf("History request skipped (offline): %s\n", entity_id);
+  } else if (!history_topic || !*history_topic) {
+    Serial.printf("History request skipped (no topic): %s\n", entity_id);
+  }
+}
+
+void mqttPrefetchHistoryRequest(const char* entity_id,
+                                uint16_t hours,
+                                uint16_t period_minutes,
+                                uint16_t points) {
+  if (!entity_id || !*entity_id || hardwareIo.isLocalEntityId(entity_id)) return;
+  normalize_history_range(hours, period_minutes, points);
+  const char* history_topic = networkManager.getHistoryRequestTopic();
+  if (!networkManager.isMqttConnected() || !history_topic || !*history_topic) return;
+  // A fresh answer is replayed by the popup's own request; nothing here
+  // reaches a popup or a tile graph.
+  if (fresh_history_replay(entity_id, hours, period_minutes, points) ||
+      history_request_on_its_way(entity_id, hours, period_minutes, points)) {
+    return;
+  }
+  clear_pending_history_request(entity_id);
+  send_history_request(history_topic, entity_id, hours, period_minutes, points);
+}
+
+static void mqttPublishDiscreteHistoryRequest(const char* entity_id,
+                                              const char* kind,
+                                              const char* log_tag,
+                                              uint16_t hours,
+                                              uint16_t max_transitions) {
+  if (!entity_id || !*entity_id) return;
+
+  hours = hours == 168 ? 168 : 24;
+  if (max_transitions == 0) max_transitions = 48;
+  if (max_transitions < 2) max_transitions = 2;
+  if (max_transitions > 96) max_transitions = 96;
+
+  // Only one popup can be visible. A new request supersedes any pending
+  // request for the previous popup entity or range.
+  g_pending_discrete_history = {};
+  const bool mqtt_online = networkManager.isMqttConnected();
+  const char* history_topic = networkManager.getHistoryRequestTopic();
+  if (!mqtt_online || !history_topic || !*history_topic) {
+    queue_discrete_history_unavailable(
+        entity_id, kind, hours,
+        mqtt_online ? "missing_topic" : "mqtt_offline");
+    Serial.printf("[%s] Request unavailable for %s (%s)\n", log_tag,
+                  entity_id,
+                  mqtt_online ? "missing topic" : "MQTT offline");
+    return;
+  }
+
+  String payload;
+  payload.reserve(160);
+  payload = "{\"version\":1,\"kind\":\"";
+  payload += kind;
+  payload += "\",\"entity_id\":\"";
+  payload += entity_id;
+  payload += "\",\"hours\":";
+  payload += String(hours);
+  payload += ",\"max_transitions\":";
+  payload += String(max_transitions);
+  payload += "}";
+
+  const bool queued = networkManager.mqttEnqueuePublishWithLargeBuffer(
+      history_topic, payload.c_str(), false, 20000, true);
+  Serial.printf("[%s] Request -> '%s' (%s, priority)\n", log_tag,
+                history_topic, queued ? "queued" : "queue-full");
+  if (queued) {
+    mark_pending_discrete_history_request(entity_id, kind, hours);
+    return;
+  }
+
+  queue_discrete_history_unavailable(entity_id, kind, hours,
+                                     "publish_failed");
+}
+
+void mqttPublishBinaryHistoryRequest(const char* entity_id,
+                                     uint16_t hours,
+                                     uint16_t max_transitions) {
+  mqttPublishDiscreteHistoryRequest(entity_id, "binary", "BinaryHistory",
+                                    hours, max_transitions);
+}
+
+void mqttPublishStateHistoryRequest(const char* entity_id,
+                                    uint16_t hours,
+                                    uint16_t max_transitions) {
+  mqttPublishDiscreteHistoryRequest(entity_id, "state", "StateHistory",
+                                    hours, max_transitions);
+}
+
+void mqttPublishWeatherRequest(const char* entity_id) {
+  if (!entity_id || !*entity_id) return;
+
+  if (!networkManager.isMqttConnected()) return;
+
+  const char* weather_topic = networkManager.getWeatherRequestTopic();
+  if (!weather_topic || !*weather_topic) return;
+
+  String payload = "{\"entity_id\":\"";
+  payload += entity_id;
+  payload += "\"}";
+
+  bool queued = networkManager.mqttEnqueuePublish(weather_topic, payload.c_str(), false);
+  Serial.printf("Weather request -> '%s' (%s)\n", weather_topic, queued ? "queued" : "queue-full");
+}
+
+bool mqttPublishEnergyRequest(const char* period) {
+  const char* p = (period && *period) ? period : "day";
+  if (strcmp(p, "week") != 0 && strcmp(p, "month") != 0 && strcmp(p, "year") != 0) {
+    p = "day";
+  }
+
+  if (!networkManager.isMqttConnected()) {
+    Serial.printf("Energy request skipped (offline): %s\n", p);
+    return false;
+  }
+
+  const char* energy_topic = networkManager.getEnergyRequestTopic();
+  if (!energy_topic || !*energy_topic) {
+    Serial.printf("Energy request skipped (no topic): %s\n", p);
+    return false;
+  }
+
+  String payload = "{\"period\":\"";
+  payload += p;
+  payload += "\"";
+  // The week runs from the panel's first weekday (tm_wday); a Bridge before
+  // v0.9.6b3 ignores it and answers the last seven days.
+  if (strcmp(p, "week") == 0) {
+    payload += ",\"week_start\":";
+    payload += String(week_start::panel());
+  }
+  payload += "}";
+
+  // Changing the selected range is interactive like a history request.
+  // Queue it ahead of a long subscribe burst without touching the client
+  // from the loop task or bypassing P4 SDIO guard intervals.
+  bool queued = networkManager.mqttEnqueuePublishWithLargeBuffer(
+      energy_topic, payload.c_str(), false, 12000, true);
+  Serial.printf("Energy request -> '%s' period=%s (%s, priority)\n",
+                energy_topic,
+                p,
+                queued ? "queued" : "queue-full");
+  return queued;
+}
+
+// ========== Home Assistant MQTT Discovery ==========
+void mqttPublishDiscovery() {
+  if (!networkManager.isMqttConnected()) return;
+
+  Serial.println("Publishing Home Assistant discovery payloads...");
+
+  char did[24];
+  buildDeviceId(did, sizeof(did));
+
+  char tpc[128];
+
+  // Remove legacy discovery entries: these sensors and buttons now come
+  // from the HA integration (tab5_lvgl/HomeTiles Bridge). They were
+  // retained MQTT discovery messages; an empty retained payload removes
+  // each entry. Otherwise every device_id change, such as the full-MAC fix,
+  // leaves another orphan "Waveshare P4 Panel" in native MQTT discovery.
+  // Four such phantom devices were observed on one installation.
+  const char* legacy_configs[] = {
+    "outside_c", "inside_c", "external_c", "soc_pct", "uptime",
+  };
+  for (const char* leaf : legacy_configs) {
+    snprintf(tpc, sizeof(tpc), "homeassistant/sensor/%s_%s/config", did, leaf);
+    networkManager.mqttEnqueuePublish(tpc, "", true);
+  }
+  const char* legacy_buttons[] = {
+    "scene_abend", "scene_lesen", "scene_allesaus",
+  };
+  for (const char* leaf : legacy_buttons) {
+    snprintf(tpc, sizeof(tpc), "homeassistant/button/%s_%s/config", did, leaf);
+    networkManager.mqttEnqueuePublish(tpc, "", true);
+  }
+
+  Serial.println("Legacy Home Assistant discovery cleared");
+}
+
+static bool topicListContains(const std::vector<String>& topics,
+                              const String& needle) {
+  return std::find(topics.begin(), topics.end(), needle) != topics.end();
+}
+
+void mqttReloadDynamicSlots(bool subscribe_all) {
+  const bool mqtt_online = networkManager.isMqttConnected();
+  std::vector<String> old_topics;
+  old_topics.reserve(g_dynamic_routes.size() + g_dynamic_weather_routes.size());
+  for (const auto& route : g_dynamic_routes) {
+    if (!topicListContains(old_topics, route.topic)) old_topics.push_back(route.topic);
+  }
+  for (const auto& route : g_dynamic_weather_routes) {
+    if (!topicListContains(old_topics, route.topic)) old_topics.push_back(route.topic);
+  }
+
+  uint32_t t_sensor0 = millis();
+  rebuildDynamicRoutes(g_dynamic_routes);
+  Serial.printf("[Bridge] rebuildDynamicRoutes: %u ms\n", (unsigned)(millis() - t_sensor0));
+  uint32_t t_weather0 = millis();
+  rebuildDynamicWeatherRoutes(g_dynamic_weather_routes);
+  Serial.printf("[Bridge] rebuildDynamicWeatherRoutes: %u ms\n", (unsigned)(millis() - t_weather0));
+
+  std::vector<String> new_topics;
+  new_topics.reserve(g_dynamic_routes.size() + g_dynamic_weather_routes.size());
+  for (const auto& route : g_dynamic_routes) {
+    if (!topicListContains(new_topics, route.topic)) new_topics.push_back(route.topic);
+  }
+  for (const auto& route : g_dynamic_weather_routes) {
+    if (!topicListContains(new_topics, route.topic)) new_topics.push_back(route.topic);
+  }
+
+  uint32_t t_control0 = millis();
+  size_t unsubscribe_count = 0;
+  size_t subscribe_count = 0;
+  if (mqtt_online) {
+    // For ordinary Bridge refreshes, apply only the actual route difference.
+    // Previously every old topic was unsubscribed and every new topic
+    // resubscribed each time; two quick refreshes could exceed 128 control
+    // commands and continually overflow the queue.
+    if (!subscribe_all) {
+      for (const auto& topic : old_topics) {
+        if (topicListContains(new_topics, topic)) continue;
+        if (networkManager.mqttEnqueueUnsubscribe(topic.c_str())) {
+          ++unsubscribe_count;
+        }
+        lvglServiceDuringBlockingWork();
+      }
+    }
+    for (const auto& topic : new_topics) {
+      if (!subscribe_all && topicListContains(old_topics, topic)) continue;
+      if (networkManager.mqttEnqueueSubscribe(topic.c_str())) ++subscribe_count;
+      lvglServiceDuringBlockingWork();
+    }
+  }
+  Serial.printf("[Bridge] Dynamic subscriptions: -%u +%u topics in %u ms%s\n",
+                static_cast<unsigned>(unsubscribe_count),
+                static_cast<unsigned>(subscribe_count),
+                static_cast<unsigned>(millis() - t_control0),
+                subscribe_all ? " (reconnect)" : "");
+}
+
+void mqttRequestDynamicSlotsReload(uint32_t quiet_ms) {
+  if (quiet_ms == 0) quiet_ms = kDynamicSlotReloadQuietMs;
+  const uint32_t due = millis() + quiet_ms;
+  if (!g_dynamic_slots_reload_requested ||
+      (int32_t)(due - g_dynamic_slots_reload_due_ms) > 0) {
+    g_dynamic_slots_reload_due_ms = due;
+  }
+  g_dynamic_slots_reload_requested = true;
+}
+
+void mqttServiceDynamicSlotsReload() {
+  if (!g_dynamic_slots_reload_requested) return;
+
+  const uint32_t now = millis();
+  if (webAdminRecentlyActive(kDynamicSlotReloadAdminQuietMs)) {
+    g_dynamic_slots_reload_due_ms = now + kDynamicSlotReloadQuietMs;
+    return;
+  }
+  if ((int32_t)(now - g_dynamic_slots_reload_due_ms) < 0) {
+    return;
+  }
+
+  g_dynamic_slots_reload_requested = false;
+  uint32_t t_slots0 = millis();
+  mqttReloadDynamicSlots();
+  Serial.printf("[Bridge] Deferred dynamic subscriptions: %u ms\n",
+                (unsigned)(millis() - t_slots0));
+}
+
+// ========== Post-Connect (Loop-Task) ==========
+// The MQTT worker marks each successful reconnect pending. This function
+// consumes that flag once per loop iteration and starts the application
+// layer on the loop task: route reload scans flash folders and services
+// LVGL; settings/snapshot publication reads battery I2C and updates grids.
+// All resulting publishes and subscribes return through the outbound queue.
+void mqttServicePostConnect() {
+  if (!networkManager.consumeMqttPostConnectPending()) return;
+  if (networkManager.linkPairMode()) {
+    // A direct link in pair mode carries the pairing topics only.
+    Serial.println("[Link] Post-connect in pair mode: pairing only");
+    command_channel::onMqttConnected();
+    return;
+  }
+  Serial.printf("[%s] Post-connect: subscriptions/discovery/settings (loop task)\n", networkManager.bridgeLogName());
+  viewNavigationConnected();
+  mqttSubscribeTopics();
+  mqttPublishDiscovery();
+  mqttPublishDeviceSettings();
+  mqttPublishHomeSnapshot();
+  // Retained {base}/stat/local_camera on camera profiles; no-op elsewhere.
+  local_camera::onMqttConnected();
+  // Bridge pairing: secure topic subscription, status and session request.
+  command_channel::onMqttConnected();
+  // Retained {base}/stat/audio (and {base}/stat/assist once the microphone
+  // answered) on speaker profiles; no-op elsewhere.
+  speaker::onMqttConnected();
+  // Announce the exact MAC-based Bridge topic after every connection. Without
+  // this retained message the HA integration cannot discover a new device or
+  // repair an entry that still points at an older device ID. The publish uses
+  // the large-buffer queue, which is held back until the startup storm ends.
+  networkManager.publishBridgeConfig();
+}
+
+// A panel whose speaker plays Bridge streams asks for the camera's sound;
+// the Bridge plays it when the camera's stream has an audio track
+// (audio_stream_contract.h). The transport name matches the speaker status.
+static const char* camera_audio_field() {
+  return speaker::bridgeCapability() ? ",\"audio\":\"tcp-ack-v1\"" : "";
+}
+
+// The panel's own JPEG quality for the Bridge, or nothing for the Bridge's.
+static void camera_quality_field(char* out, size_t size) {
+  out[0] = '\0';
+  if (camera_geometry::kJpegQuality) {
+    snprintf(out, size, ",\"quality\":%u",
+             static_cast<unsigned>(camera_geometry::kJpegQuality));
+  }
+}
+
+void mqttPublishCameraFullScreenOpen(const char* entity_id, uint8_t fps,
+                                     uint16_t width, uint16_t height,
+                                     uint16_t turn_cw) {
+  if (!entity_id || !*entity_id) return;
+  const auto& text = i18n::strings(configManager.getConfig().language);
+  const camera_transport::Request transport = camera_transport::request();
+  const char* topic = mqttTopics.topic(TopicKey::CAMERA_CMND);
+  if (!networkManager.isMqttConnected() || !topic || !*topic) {
+    camera_popup_set_status(text.camera_mqtt_disconnected, true);
+    return;
+  }
+  char quality[24];
+  camera_quality_field(quality, sizeof(quality));
+  char payload[384];
+  snprintf(payload, sizeof(payload),
+           "{\"entity_id\":\"%s\",\"command\":\"open\","
+           "\"width\":%u,\"height\":%u,\"fps\":%u,"
+           "\"view\":\"full\",\"rotate\":%u,\"fit\":\"%s\","
+           "\"chunk\":%u,\"window\":%u%s%s,"
+           "\"transport\":\"tcp-ack-v1\",\"protocol_version\":1}",
+           entity_id, static_cast<unsigned>(width),
+           static_cast<unsigned>(height),
+           static_cast<unsigned>(fps ? fps : camera_geometry::kFps),
+           static_cast<unsigned>(turn_cw), camera_geometry::kFullFit,
+           static_cast<unsigned>(transport.chunk_bytes),
+           static_cast<unsigned>(transport.window), quality, camera_audio_field());
+  const bool queued =
+      networkManager.mqttEnqueuePublishPriority(topic, payload, false);
+  Serial.printf("[Camera] command open full screen %ux%u -> %s (%s)\n",
+                static_cast<unsigned>(width), static_cast<unsigned>(height),
+                topic, queued ? "queued" : "queue-full");
+  if (!queued) camera_popup_set_status(text.camera_mqtt_queue_full, true);
+}
+
+void mqttPublishCameraCommand(const char* entity_id, const char* command,
+                              uint8_t fps) {
+  if (!entity_id || !*entity_id) return;
+  const auto& text = i18n::strings(configManager.getConfig().language);
+  if (!networkManager.isMqttConnected()) {
+    camera_popup_set_status(text.camera_mqtt_disconnected, true);
+    return;
+  }
+
+  const char* topic = mqttTopics.topic(TopicKey::CAMERA_CMND);
+  if (!topic || !*topic) {
+    camera_popup_set_status(text.camera_mqtt_topic_missing, true);
+    return;
+  }
+
+  const char* action = (command && *command) ? command : "open";
+  char payload[384];
+  if (strcmp(action, "open") == 0) {
+    const camera_transport::Request transport = camera_transport::request();
+    char quality[24];
+    camera_quality_field(quality, sizeof(quality));
+    snprintf(payload, sizeof(payload),
+             "{\"entity_id\":\"%s\",\"command\":\"%s\","
+             "\"width\":%u,\"height\":%u,\"fps\":%u,"
+             "\"chunk\":%u,\"window\":%u%s%s,"
+             "\"transport\":\"tcp-ack-v1\",\"protocol_version\":1}",
+             entity_id, action,
+             camera_geometry::kWidth,
+             camera_geometry::kHeight,
+             fps ? fps : camera_geometry::kFps,
+             static_cast<unsigned>(transport.chunk_bytes),
+             static_cast<unsigned>(transport.window), quality, camera_audio_field());
+  } else {
+    snprintf(payload, sizeof(payload),
+             "{\"entity_id\":\"%s\",\"command\":\"%s\"}",
+             entity_id, action);
+  }
+  const bool queued =
+      networkManager.mqttEnqueuePublishPriority(topic, payload, false);
+  Serial.printf("[Camera] command %s -> %s (%s)\n", action, topic,
+                queued ? "queued" : "queue-full");
+  if (!queued) camera_popup_set_status(text.camera_mqtt_queue_full, true);
+}

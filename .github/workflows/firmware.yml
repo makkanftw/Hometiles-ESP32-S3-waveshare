@@ -1,0 +1,695 @@
+# Release workflow: update FW_VERSION in version.txt, commit, create the
+# matching vX.Y.Z tag, then push the tag. Release builds run only on tag pushes;
+# the tag must exactly match FW_VERSION, as checked below. A manual S3 draft
+# repair rebuilds only S3 assets at the existing version. See RELEASING.md.
+name: Firmware builds
+
+on:
+  pull_request:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      repair_s3_release:
+        description: 'Existing draft release to repair with only the three S3 profiles (empty builds all candidates)'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: firmware-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ARDUINO_CORE_VERSION: "3.3.7"
+  ARDUINO_CACHE_KEY: arduino-esp32-3.3.7-libs-v5-lvgl-9.6.0
+
+jobs:
+  toolchain:
+    name: Prepare Arduino toolchain
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate requested S3 release repair
+        if: inputs.repair_s3_release != ''
+        env:
+          REPAIR_RELEASE: ${{ inputs.repair_s3_release }}
+        run: node tools/repair-s3-release.mjs --validate
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install pinned host tooling
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Verify generated device profiles
+        run: node tools/generate-device-profiles.mjs --check
+
+      - name: Verify generated WebUI assets
+        run: node tools/generate-web-assets.mjs --check
+
+      - name: Run the source and browser test suite
+        run: node tools/run-tests.mjs
+
+      - name: Set up Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Restore Arduino cache
+        id: arduino-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.arduino15
+            ~/Arduino/libraries
+          key: ${{ env.ARDUINO_CACHE_KEY }}
+
+      - name: Install ESP32 core and Arduino libraries
+        shell: bash
+        run: |
+          retry() {
+            local max_attempts="$1"
+            shift
+            local attempt
+            for attempt in $(seq 1 "${max_attempts}"); do
+              "$@" && return 0
+              echo "Command failed on attempt ${attempt}: $*"
+              if [ "${attempt}" -lt "${max_attempts}" ]; then
+                sleep $((attempt * 30))
+              fi
+            done
+            return 1
+          }
+
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls "https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json"
+          retry 5 arduino-cli core update-index
+          retry 12 arduino-cli core install "esp32:esp32@${ARDUINO_CORE_VERSION}"
+          retry 5 arduino-cli lib update-index
+          # --no-deps: a library's dependencies would be installed in their
+          # newest version over the pinned ones (M5Unified pulled M5GFX
+          # 0.2.32 instead of 0.2.25, the Tab5 image no longer fit).
+          retry 5 arduino-cli lib install --no-deps "ArduinoJson@7.4.3"
+          retry 5 arduino-cli lib install --no-deps "DallasTemperature@4.0.6"
+          retry 5 arduino-cli lib install --no-deps "GFX Library for Arduino@1.6.5"
+          retry 5 arduino-cli lib install --no-deps "lvgl@9.6.0"
+          retry 5 arduino-cli lib install --no-deps "M5GFX@0.2.25"
+          retry 5 arduino-cli lib install --no-deps "M5Unified@0.2.14"
+          retry 5 arduino-cli lib install --no-deps "OneWire@2.3.8"
+          retry 5 arduino-cli lib install --no-deps "PubSubClient@2.8"
+
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    needs: toolchain
+    strategy:
+      fail-fast: false
+      matrix:
+        # BEGIN GENERATED DEVICE MATRIX
+        include:
+          - label: M5Stack Tab5
+            profile: tab5
+            key: m5stacks_tab5
+            define: DEVICE_M5STACKS_TAB5
+            silicon_variant: pre_v3
+            rx_variant: repo-a8204
+            publish: true
+          - label: Waveshare 4B
+            profile: waveshare_b4
+            key: waveshare_4b
+            define: DEVICE_WAVESHARE_4B
+            silicon_variant: pre_v3
+            rx_variant: repo-a8204
+            publish: true
+          - label: Waveshare Touch LCD 4.3
+            profile: waveshare_4_3
+            key: waveshare_touch_lcd_4_3
+            define: DEVICE_WAVESHARE_TOUCH_LCD_4_3
+            silicon_variant: pre_v3
+            rx_variant: repo-a8204
+            publish: true
+          - label: Waveshare 7 inch
+            profile: waveshare_7
+            key: waveshare_touch_lcd_7
+            define: DEVICE_WAVESHARE_TOUCH_LCD_7
+            silicon_variant: pre_v3
+            rx_variant: repo-a8204
+            publish: true
+          - label: Waveshare 7B / 7B-C
+            profile: waveshare_7b
+            key: waveshare_touch_lcd_7b
+            define: DEVICE_WAVESHARE_TOUCH_LCD_7B
+            silicon_variant: pre_v3
+            rx_variant: repo-a8204
+            publish: true
+          - label: Waveshare 7B / 7B-C (ESP32-P4 v3.1 or newer, experimental)
+            profile: waveshare_7b_rev3
+            key: waveshare_touch_lcd_7b_rev3
+            metadata_key: waveshare_touch_lcd_7b
+            define: DEVICE_WAVESHARE_TOUCH_LCD_7B
+            silicon_variant: post_v3
+            rx_variant: repo-a8204
+            publish: true
+          - label: Waveshare 8 inch
+            profile: waveshare_8
+            key: waveshare_touch_lcd_8
+            define: DEVICE_WAVESHARE_TOUCH_LCD_8
+            silicon_variant: pre_v3
+            rx_variant: repo-a8204
+            publish: true
+          - label: Waveshare 10.1 inch
+            profile: waveshare_10_1
+            key: waveshare_touch_lcd_10_1
+            define: DEVICE_WAVESHARE_TOUCH_LCD_10_1
+            silicon_variant: pre_v3
+            rx_variant: repo-a8204
+            publish: true
+          - label: Guition JC8012P4A1
+            profile: guition_jc8012p4a1
+            key: guition_jc8012p4a1
+            define: DEVICE_GUITION_JC8012P4A1
+            silicon_variant: pre_v3
+            rx_variant: repo-guition-jc8012-rx-single-block
+            publish: true
+          - label: Guition JC8012P4A1 V2
+            profile: guition_jc8012p4a1_v2
+            key: guition_jc8012p4a1_v2
+            define: DEVICE_GUITION_JC8012P4A1_V2
+            silicon_variant: pre_v3
+            rx_variant: repo-a8204
+            publish: true
+          - label: Guition JC1060P470C
+            profile: guition_jc1060p470c
+            key: guition_jc1060p470c
+            define: DEVICE_GUITION_JC1060P470C
+            silicon_variant: pre_v3
+            rx_variant: repo-a8204
+            publish: true
+          - label: Guition JC1060P470C V2
+            profile: guition_jc1060p470c_v2
+            key: guition_jc1060p470c_v2
+            define: DEVICE_GUITION_JC1060P470C_V2
+            silicon_variant: pre_v3
+            rx_variant: repo-a8204
+            publish: true
+          - label: GUITION ESP32-4848S040
+            profile: guition_esp32_4848s040
+            key: guition_esp32_4848s040
+            define: DEVICE_GUITION_ESP32_4848S040
+            rx_variant: native-s3
+            publish: true
+          - label: Waveshare ESP32-S3 Touch LCD 4 Rev 4.0
+            profile: waveshare_s3_touch_lcd_4
+            key: waveshare_s3_touch_lcd_4
+            define: DEVICE_WAVESHARE_S3_TOUCH_LCD_4
+            rx_variant: native-s3
+            publish: true
+          - label: Waveshare ESP32-S3 Touch LCD 4B
+            profile: waveshare_s3_touch_lcd_4b
+            key: waveshare_s3_touch_lcd_4b
+            define: DEVICE_WAVESHARE_S3_TOUCH_LCD_4B
+            rx_variant: native-s3
+            publish: true
+          - label: Guition JC4880P443
+            profile: guition_jc4880p443_portrait
+            key: guition_jc4880p443_portrait
+            define: DEVICE_GUITION_JC4880P443_PORTRAIT
+            silicon_variant: pre_v3
+            rx_variant: repo-a8204
+            publish: true
+          - label: Waveshare 10.1 inch (ESP32-P4 v3.1 or newer, experimental)
+            profile: waveshare_10_1_rev3
+            key: waveshare_touch_lcd_10_1_rev3
+            metadata_key: waveshare_touch_lcd_10_1
+            define: DEVICE_WAVESHARE_TOUCH_LCD_10_1
+            silicon_variant: post_v3
+            rx_variant: repo-a8204
+            publish: true
+          - label: Guition JC8012P4A1 V3 (ESP32-P4 v3.1 or newer, experimental)
+            profile: guition_jc8012p4a1_v3
+            key: guition_jc8012p4a1_v3
+            metadata_key: guition_jc8012p4a1_v2
+            define: DEVICE_GUITION_JC8012P4A1_V2
+            silicon_variant: post_v3
+            rx_variant: repo-a8204
+            publish: true
+          - label: Waveshare Touch LCD 5 inch
+            profile: waveshare_5
+            key: waveshare_touch_lcd_5
+            define: DEVICE_WAVESHARE_TOUCH_LCD_5
+            silicon_variant: pre_v3
+            rx_variant: repo-a8204
+            publish: true
+          - label: Waveshare Touch LCD 5 inch (ESP32-P4 v3.1 or newer, experimental)
+            profile: waveshare_5_rev3
+            key: waveshare_touch_lcd_5_rev3
+            metadata_key: waveshare_touch_lcd_5
+            define: DEVICE_WAVESHARE_TOUCH_LCD_5
+            silicon_variant: post_v3
+            rx_variant: repo-a8204
+            publish: true
+          - label: Golden Security GS-T3E v2
+            profile: golden_security_gs_t3e_v2
+            key: golden_security_gs_t3e_v2
+            define: DEVICE_GOLDEN_SECURITY_GS_T3E_V2
+            rx_variant: native-s3
+            publish: true
+          - label: Waveshare Touch LCD 4.3 (ESP32-P4 v3.1 or newer, experimental)
+            profile: waveshare_4_3_rev3
+            key: waveshare_touch_lcd_4_3_rev3
+            metadata_key: waveshare_touch_lcd_4_3
+            define: DEVICE_WAVESHARE_TOUCH_LCD_4_3
+            silicon_variant: post_v3
+            rx_variant: repo-a8204
+            publish: true
+          - label: Waveshare 8 inch (ESP32-P4 v3.1 or newer, experimental)
+            profile: waveshare_8_rev3
+            key: waveshare_touch_lcd_8_rev3
+            metadata_key: waveshare_touch_lcd_8
+            define: DEVICE_WAVESHARE_TOUCH_LCD_8
+            silicon_variant: post_v3
+            rx_variant: repo-a8204
+            publish: true
+          - label: Waveshare ESP32-S3 Touch LCD 7
+            profile: waveshare_s3_touch_lcd_7
+            key: waveshare_s3_touch_lcd_7
+            define: DEVICE_WAVESHARE_S3_TOUCH_LCD_7
+            rx_variant: native-s3
+            publish: true
+        # END GENERATED DEVICE MATRIX
+
+    steps:
+      - name: Check out repository
+        if: ${{ !inputs.repair_s3_release || matrix.rx_variant == 'native-s3' }}
+        uses: actions/checkout@v4
+
+      - name: Set up Arduino CLI
+        if: ${{ !inputs.repair_s3_release || matrix.rx_variant == 'native-s3' }}
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Set up Node.js
+        if: ${{ !inputs.repair_s3_release || matrix.rx_variant == 'native-s3' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Restore Arduino cache
+        if: ${{ !inputs.repair_s3_release || matrix.rx_variant == 'native-s3' }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.arduino15
+            ~/Arduino/libraries
+          key: ${{ env.ARDUINO_CACHE_KEY }}
+
+      - name: Configure Arduino CLI
+        if: ${{ !inputs.repair_s3_release || matrix.rx_variant == 'native-s3' }}
+        shell: bash
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls "https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json"
+          arduino-cli core list
+          arduino-cli lib list
+
+      - name: Apply target-specific ESP-Hosted 3.3.7 fixes
+        if: matrix.rx_variant != 'native-s3' && !inputs.repair_s3_release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ar_bin="$(find "$HOME/.arduino15/packages/esp32/tools" -type f -path '*/bin/riscv32-esp-elf-ar' -print -quit)"
+          test -x "$ar_bin"
+
+          for variant in esp32p4-libs esp32p4_es-libs; do
+            archive="$HOME/.arduino15/packages/esp32/tools/${variant}/${ARDUINO_CORE_VERSION}/lib/libespressif__esp_hosted.a"
+            test -f "$archive"
+
+            fixed_objects=("$GITHUB_WORKSPACE/tools/esp-hosted-3.3.7-tx-fix/${variant}"/*.obj)
+            for fixed_object in "$GITHUB_WORKSPACE/tools/esp-hosted-3.3.7-rx-fix/${variant}"/*.obj; do
+              if [ "$(basename "$fixed_object")" != "sdio_drv.c.obj" ]; then
+                fixed_objects+=("$fixed_object")
+              fi
+            done
+            fixed_objects+=("$GITHUB_WORKSPACE/tools/esp-hosted-3.3.7-rx-fix/baseline-a8204/${variant}/sdio_drv.c.obj")
+
+            if [ "${variant}" = "esp32p4_es-libs" ]; then
+              port_sdio_variant="baseline-a8204"
+              if [ "${{ matrix.rx_variant }}" = "repo-guition-jc8012-rx-single-block" ]; then
+                port_sdio_variant="guition-jc8012-rx-single-block"
+              fi
+              fixed_objects+=("$GITHUB_WORKSPACE/tools/esp-hosted-3.3.7-rx-fix/${port_sdio_variant}/${variant}/port_esp_hosted_host_sdio.c.obj")
+            fi
+
+            for fixed_object in "${fixed_objects[@]}"; do
+              test -f "$fixed_object"
+              object_name="$(basename "$fixed_object")"
+
+              work_dir="$(mktemp -d)"
+              cp "$fixed_object" "$work_dir/$object_name"
+              "$ar_bin" rs "$archive" "$work_dir/$object_name"
+              (
+                cd "$work_dir"
+                rm "$object_name"
+                "$ar_bin" x "$archive" "$object_name"
+                cmp "$object_name" "$fixed_object"
+              )
+              rm -rf "$work_dir"
+            done
+          done
+
+      # The panel keeps refreshing during flash writes (no blue flash):
+      # tools/esp-idf-3.3.7-p4-cache-safe/README.md.
+      - name: Apply cache-safe P4 display and camera DMA objects
+        if: matrix.rx_variant != 'native-s3' && !inputs.repair_s3_release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ar_bin="$(find "$HOME/.arduino15/packages/esp32/tools" -type f -path '*/bin/riscv32-esp-elf-ar' -print -quit)"
+          test -x "$ar_bin"
+
+          for variant in esp32p4-libs esp32p4_es-libs; do
+            lib_dir="$HOME/.arduino15/packages/esp32/tools/${variant}/${ARDUINO_CORE_VERSION}/lib"
+            for pair in esp_lcd_panel_dpi.c.obj:libesp_lcd.a dw_gdma.c.obj:libesp_hw_support.a esp_cam_ctlr_csi.c.obj:libesp_driver_cam.a; do
+              object_name="${pair%%:*}"
+              archive="${lib_dir}/${pair##*:}"
+              fixed_object="$GITHUB_WORKSPACE/tools/esp-idf-3.3.7-p4-cache-safe/${variant}/${object_name}"
+              test -f "$archive"
+              test -f "$fixed_object"
+
+              work_dir="$(mktemp -d)"
+              cp "$fixed_object" "$work_dir/$object_name"
+              "$ar_bin" rs "$archive" "$work_dir/$object_name"
+              (
+                cd "$work_dir"
+                rm "$object_name"
+                "$ar_bin" x "$archive" "$object_name"
+                cmp "$object_name" "$fixed_object"
+              )
+              rm -rf "$work_dir"
+            done
+          done
+
+      - name: Verify release tag matches firmware version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version="$(node -e "const fs=require('fs'); const text=fs.readFileSync('version.txt','utf8'); const m=text.match(/FW_VERSION\s+\"([^\"]+)\"/); if(!m) process.exit(1); process.stdout.write(m[1]);")"
+          if [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match FW_VERSION $version"
+            exit 1
+          fi
+
+      - name: Compile firmware
+        if: ${{ !inputs.repair_s3_release || matrix.rx_variant == 'native-s3' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # `arduino-cli compile --profile` installs the profile platform again
+          # immediately before compiling. That silently replaced the patched
+          # ESP-Hosted archive above with the stock 3.3.7 archive. Read the FQBN
+          # from the same profile, but compile by FQBN so the prepared toolchain
+          # remains untouched.
+          profile="${{ matrix.profile }}"
+          fqbn="$(awk -v wanted="${profile}" '
+            /^  [^[:space:]][^:]*:$/ {
+              name=$1
+              sub(/:$/, "", name)
+              in_profile=(name == wanted)
+              next
+            }
+            in_profile && /^    fqbn:/ {
+              sub(/^    fqbn:[[:space:]]*/, "")
+              print
+              exit
+            }
+          ' sketch.yaml)"
+          test -n "${fqbn}"
+
+          # arduino-cli still discovers sketch.yaml even when compiling with
+          # --fqbn and then reinstalls the default profile dependencies. Hide
+          # the profile file for the compile itself so the patched ESP-Hosted
+          # archive cannot be replaced by the stock core package again.
+          sketch_profiles_file="${RUNNER_TEMP}/hometiles-sketch-${{ matrix.key }}.yaml"
+          mv sketch.yaml "${sketch_profiles_file}"
+          restore_sketch_profiles() {
+            if [ -f "${sketch_profiles_file}" ]; then
+              mv "${sketch_profiles_file}" sketch.yaml
+            fi
+          }
+          trap restore_sketch_profiles EXIT
+
+          common_flags="-DLV_CONF_INCLUDE_SIMPLE -I$GITHUB_WORKSPACE -I$HOME/Arduino/libraries"
+          elf_flags=""
+          if [ "${profile}" = "guition_jc8012p4a1" ]; then
+            elf_flags="-Wl,--wrap=esp_hosted_get_default_sdio_config"
+          elif [ "${profile}" = "waveshare_7b_rev3" ]; then
+            # Issue #41: SDIO at 20 MHz, no C6 version query (device code).
+            elf_flags="-Wl,--wrap=esp_hosted_get_default_sdio_config -Wl,--wrap=esp_hosted_get_coprocessor_fwversion"
+          fi
+          # The SDK flag file enables -fexceptions for all C++ code, but
+          # HomeTiles never throws or catches; the unwind tables only cost
+          # flash. compiler.cpp.extra_flags precedes that flag file in
+          # recipe.cpp.o.pattern, so repeat the platform.txt line and append
+          # -fno-exceptions after it. A new core must update both lines.
+          platform_cpp_flags='-MMD -c "@{compiler.sdk.path}/flags/cpp_flags" {compiler.warning_flags} {compiler.optimization_flags} {compiler.common_werror_flags}'
+          platform_txt="$HOME/.arduino15/packages/esp32/hardware/esp32/${ARDUINO_CORE_VERSION}/platform.txt"
+          if ! grep -Fqx "compiler.cpp.flags=${platform_cpp_flags}" "${platform_txt}"; then
+            echo "::error::compiler.cpp.flags in ${platform_txt} changed; update the -fno-exceptions override."
+            exit 1
+          fi
+          arduino-cli compile \
+            --fqbn "${fqbn}" \
+            --export-binaries \
+            --output-dir "build/ci/${{ matrix.key }}" \
+            --build-property "compiler.c.extra_flags=-DHOMETILES_CI_TARGET -D${{ matrix.define }} $common_flags" \
+            --build-property "compiler.cpp.extra_flags=-DHOMETILES_CI_TARGET -D${{ matrix.define }} $common_flags" \
+            --build-property "compiler.cpp.flags=${platform_cpp_flags} -fno-exceptions" \
+            --build-property "compiler.c.elf.extra_flags=${elf_flags}"
+
+          restore_sketch_profiles
+          trap - EXIT
+
+          # Fatal ESP-Hosted allocation asserts retain their expression text
+          # in P4 images. Native-WiFi S3 targets do not link ESP-Hosted.
+          firmware_bin="build/ci/${{ matrix.key }}/HomeTiles.ino.bin"
+          test -f "${firmware_bin}"
+          if [ "${{ matrix.rx_variant }}" != "native-s3" ]; then
+            for fatal_assert in copy_buff pkt_rxbuff; do
+              if grep -a -q "${fatal_assert}" "${firmware_bin}"; then
+                echo "Stock ESP-Hosted assert '${fatal_assert}' found in ${firmware_bin}" >&2
+                exit 1
+              fi
+            done
+            grep -a -F -q "HomeTiles RPC sync serialization active" "${firmware_bin}"
+            grep -a -F -q "HomeTiles SDIO RX recovery active (a8204f9 raw PKT_LEN + pending drain)" "${firmware_bin}"
+            # Only the cache-safe DW-GDMA object checks callbacks for IRAM.
+            grep -a -F -q "on_full_trans_done not in IRAM" "${firmware_bin}"
+
+            short_tail_marker="HomeTiles SDIO RX 512-byte padding disabled (CMD53 short tail, 4-byte aligned)"
+            if grep -a -F -q "${short_tail_marker}" "${firmware_bin}"; then
+              echo "Unexpected 8-inch short-tail RX patch found in ${{ matrix.label }}" >&2
+              exit 1
+            fi
+
+            single_block_marker="HomeTiles Issue30 RX single-block workaround active: max_blocks_per_CMD53=1"
+            if [ "${{ matrix.rx_variant }}" = "repo-guition-jc8012-rx-single-block" ]; then
+              grep -a -F -q "${single_block_marker}" "${firmware_bin}"
+            elif grep -a -F -q "${single_block_marker}" "${firmware_bin}"; then
+              echo "Unexpected JC8012 single-block RX patch found in ${{ matrix.label }}" >&2
+              exit 1
+            fi
+
+            firmware_map="build/ci/${{ matrix.key }}/HomeTiles.ino.map"
+            if [ "${profile}" = "guition_jc8012p4a1" ] || [ "${profile}" = "waveshare_7b_rev3" ]; then
+              grep -F -q "__wrap_esp_hosted_get_default_sdio_config" "${firmware_map}"
+            elif grep -F -q "__wrap_esp_hosted_get_default_sdio_config" "${firmware_map}"; then
+              echo "Unexpected SDIO configuration wrapper found in ${{ matrix.label }}" >&2
+              exit 1
+            fi
+
+            obsolete_marker="PKT_LEN reg all-ones (bus read error); dropping read"
+            if grep -a -F -q "${obsolete_marker}" "${firmware_bin}"; then
+              echo "Obsolete masked PKT_LEN drop path found in ${firmware_bin}" >&2
+              exit 1
+            fi
+          else
+            grep -a -F -q "HTTPS host=%s tls=%d (%s) allocator=%s" "${firmware_bin}"
+          fi
+
+      # The factory image carries the device's icon file in its LittleFS
+      # partition (release-helper/factory-icon-file.js), so a freshly flashed
+      # panel needs no download for its icons.
+      - name: Build the icon files for the factory image
+        if: ${{ !inputs.repair_s3_release || matrix.rx_variant == 'native-s3' }}
+        shell: bash
+        run: node tools/generate-icon-files.mjs --files-only --out build/icons
+
+      - name: Package firmware binaries
+        if: ${{ !inputs.repair_s3_release || matrix.rx_variant == 'native-s3' }}
+        shell: bash
+        run: |
+          node release-helper/package-ci-build.js \
+            --build-dir "build/ci/${{ matrix.key }}" \
+            --icon-dir build/icons \
+            --device-key "${{ matrix.key }}" \
+            --metadata-device-key "${{ matrix.metadata_key || matrix.key }}" \
+            --silicon-variant "${{ matrix.silicon_variant || 'default' }}"
+
+      - name: Archive private debug symbols
+        if: (startsWith(github.ref, 'refs/tags/') || inputs.repair_s3_release) && matrix.publish && (!inputs.repair_s3_release || matrix.rx_variant == 'native-s3')
+        shell: bash
+        env:
+          SYMBOLS_DEPLOY_KEY: ${{ secrets.SYMBOLS_DEPLOY_KEY }}
+          SYMBOLS_REPOSITORY: GalusPeres/HomeTiles-symbols
+          DEVICE_KEY: ${{ matrix.key }}
+          RELEASE_TAG: ${{ inputs.repair_s3_release || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          elf_path="build/ci/${DEVICE_KEY}/HomeTiles.ino.elf"
+          archive_name="hometiles_${RELEASE_TAG}_${DEVICE_KEY}.elf.gz"
+          archive_path="${RUNNER_TEMP}/${archive_name}"
+          test -f "${elf_path}"
+          gzip -9 -c "${elf_path}" > "${archive_path}"
+
+          install -m 700 -d "${HOME}/.ssh"
+          printf '%s\n' "${SYMBOLS_DEPLOY_KEY}" > "${HOME}/.ssh/id_ed25519"
+          chmod 600 "${HOME}/.ssh/id_ed25519"
+          ssh-keyscan -t ed25519 github.com > "${HOME}/.ssh/known_hosts"
+          chmod 644 "${HOME}/.ssh/known_hosts"
+
+          symbols_dir="${RUNNER_TEMP}/hometiles-symbols"
+          git clone --depth 1 "git@github.com:${SYMBOLS_REPOSITORY}.git" "${symbols_dir}"
+          cd "${symbols_dir}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # The matrix jobs finish independently. Retry against the
+          # latest private main branch if another device pushed first.
+          for attempt in 1 2 3 4 5; do
+            git fetch origin main
+            git reset --hard origin/main
+            mkdir -p "${RELEASE_TAG}"
+            cp "${archive_path}" "${RELEASE_TAG}/${archive_name}"
+            git add "${RELEASE_TAG}/${archive_name}"
+
+            if git diff --cached --quiet; then
+              exit 0
+            fi
+
+            git commit -m "Archive ${RELEASE_TAG} ${DEVICE_KEY} symbols"
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            sleep $((attempt * 2))
+          done
+
+          echo "Failed to archive ${archive_name} after concurrent push retries" >&2
+          exit 1
+
+      - name: Upload firmware artifact
+        if: (matrix.publish || matrix.candidate) && (!inputs.repair_s3_release || matrix.rx_variant == 'native-s3')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.candidate && format('candidate-{0}', matrix.key) || format('firmware-{0}', matrix.key) }}
+          path: build/releases/*.bin
+          if-no-files-found: error
+          retention-days: 14
+
+  repair-s3-release:
+    name: Verify and publish S3 release repair
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.repair_s3_release != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: firmware-*
+          path: build/s3-repair-assets
+          merge-multiple: true
+      - name: Repair the draft and publish only after verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPAIR_RELEASE: ${{ inputs.repair_s3_release }}
+        run: node tools/repair-s3-release.mjs build/s3-repair-assets
+      - name: Deploy corrected installer assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run docs.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
+
+  release:
+    name: Publish release assets
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      actions: write
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Download firmware artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: firmware-*
+          path: build/release-assets
+          merge-multiple: true
+
+      - name: Add the icon files
+        shell: bash
+        run: |
+          node tools/generate-icon-files.mjs --files-only --out build/release-assets
+
+      - name: Verify release assets
+        shell: bash
+        run: |
+          node tools/device-catalog.js --verify-release-assets build/release-assets "$GITHUB_REF_NAME"
+
+      - name: Upload assets to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "HomeTiles $GITHUB_REF_NAME" \
+              --generate-notes
+          fi
+          gh release upload "$GITHUB_REF_NAME" build/release-assets/*.bin \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+      # Release events created with GITHUB_TOKEN do not start another workflow.
+      # workflow_dispatch is the documented exception, so dispatch docs only
+      # after every release asset was uploaded successfully.
+      - name: Deploy docs after release assets are complete
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run docs.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$GITHUB_REF_NAME"

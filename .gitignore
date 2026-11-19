@@ -1,0 +1,46 @@
+# Arduino build artifacts
+*.bin
+*.elf
+*.hex
+*.map
+
+# IDE files
+.vscode/
+.idea/
+.claude/
+
+# Local Web Admin design snapshot
+/webadmin-preview/
+
+# Local MkDocs output; GitHub Actions builds its own copy
+/site/
+
+# Backup files
+*.bak
+*~
+
+# Node.js
+node_modules/
+dist/
+out/
+build/
+!tools/tests/build/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local helper directories
+.tmp_fonts/
+libraries/
+
+# Local media sources; optimized web versions live under docs/
+docs/images/IMG_4804.JPG.jpeg
+docs/videos/IMG_4807.MOV
+
+# Local SD card content, including animations
+sd-card/

@@ -1,0 +1,4378 @@
+#include "src/ui/popups/popup_shell.h"
+#include "src/ui/popups/popup_surface.h"
+#include "src/ui/popups/popup_nav_style.h"
+#include "src/ui/popups/popup_open.h"
+#include "src/types/value/value_control.h"
+#include "src/network/bridge/ha_bridge_config.h"
+#include "src/ui/popups/camera/camera_popup.h"
+#include "src/ui/navigation/view_navigation.h"
+#include "src/ui/popups/sensor/sensor_popup.h"
+#include "src/ui/popups/light/light_popup.h"
+#include "src/ui/popups/climate/climate_popup.h"
+#include "src/ui/popups/weather/weather_popup.h"
+#include "src/ui/popups/energy/energy_popup.h"
+#include "src/ui/popups/media/media_popup.h"
+#include "src/ui/popups/cover/cover_popup.h"
+#include "src/ui/popups/device/device_popup.h"
+#include "src/ui/popups/vacuum/vacuum_popup.h"
+#include "src/ui/popups/calendar/calendar_popup.h"
+#include "src/ui/popups/pin/pin_popup.h"
+#include "src/ui/popups/popup_layout.h"
+#include "src/ui/popups/popup_first_frame.h"
+#include "src/ui/popups/popup_graph_readout.h"
+#include "src/core/config/config_manager.h"
+#include "src/core/config/week_start.h"
+#include "src/core/display/display_manager.h"
+#include "src/core/memory/psram_allocator.h"
+#include "src/core/i18n/i18n.h"
+#include "src/fonts/ui_fonts.h"
+#include "src/io/hardware_io.h"
+#include "src/network/mqtt/mqtt_handlers.h"
+#include "src/tiles/icons/mdi_icons.h"
+#include "src/tiles/runtime/tile_rule_icon.h"
+#include "src/tiles/config/tile_config.h"
+#include "src/types/clock/clock_format.h"
+#include <ArduinoJson.h>
+#include <algorithm>
+#include <math.h>
+#include <mbedtls/sha256.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <vector>
+#include "src/ui/shared/area_graph.h"
+#include "src/ui/shared/ui_theme.h"
+#include "src/ui/shared/value_unit.h"
+#include <lvgl_private.h>
+
+namespace {
+
+constexpr int kCardWidth = popup_layout::kCardWidth;
+constexpr int kCardPad = popup_layout::kCardPad;
+constexpr int kHeaderPadTop = popup_layout::scale(4);
+// The time labels sit kTimeLabelGap below the graph (user 2026-10-27: a
+// little more room); the graph gives up the extra room (kTimeLabelExtra), so
+// the labels stay where they were and fit on every panel (b562 moved them
+// down instead and cut them off).
+constexpr int kTimeLabelGap = popup_layout::scale480(12);
+constexpr int kTimeLabelExtra = kTimeLabelGap - popup_layout::scale480(8);
+constexpr int kChartHeight = popup_layout::contentScale(325) - kTimeLabelExtra;
+#if defined(DEVICE_LAYOUT_1024X600)
+constexpr int kTimeAxisHeight = 24;  // full UI16 line height plus bottom breathing room
+#elif defined(DEVICE_LAYOUT_480X480)
+constexpr int kTimeAxisHeight = 20;  // full native UI14 line plus breathing room
+#else
+constexpr int kTimeAxisHeight = popup_layout::scale(20);  // space for time labels below chart
+#endif
+constexpr int kTimeAxisMarkerCount = 8;
+constexpr int kChartLineWidth = popup_layout::scale(4);
+// The numeric graph (mockup build/design-mockups/sensor-graph-2, issue
+// #131; sensor-graph-3, user 2026-10-27): the line in the header icon's
+// color, rounded but cut flush at both ends by the chart's bounds, with room
+// above the maximum and below the minimum (kChartLinePad); below it the
+// header circle's color down to the graph's middle, fading to nothing in its
+// lower half; faint solid 1 px lines at the maximum, the minimum, zero (with
+// its own label, while the line crosses it) and at the times: under the
+// 24H and 6H labels, between the days of 7D (its labels in the middle of
+// their day, as before sensor-graph-2).
+constexpr int kChartLinePad = (kChartLineWidth + 1) / 2;
+constexpr int kGraphInset = popup_layout::kHeaderIconX;
+constexpr int kGridLineWidth = 1;
+constexpr lv_opa_t kGridLineOpa = 20;  // 8 %
+// 6H in minutes (raw states; the Bridge reads statistics for 5 minutes and
+// more), 24H in 5-minute steps, 7D in hours (issue #131).
+constexpr uint16_t kHistoryHours6h = 6;
+constexpr uint16_t kHistoryPeriodMinutes6h = 1;
+constexpr uint16_t kHistoryPoints6h = 360;
+constexpr uint16_t kHistoryHours24h = 24;
+constexpr uint16_t kHistoryPeriodMinutes24h = 5;
+constexpr uint16_t kHistoryPoints24h = 288;
+constexpr uint16_t kHistoryHours7d = 168;
+constexpr uint16_t kHistoryPeriodMinutes7d = 60;
+constexpr uint16_t kHistoryPoints7d = 168;
+// Five ranges (user 2026-10-29): 1H by the minute, 30D in three-hour steps,
+// eight a day for its swing and fewer points than any graph has columns.
+constexpr uint16_t kHistoryHours1h = 1;
+constexpr uint16_t kHistoryPeriodMinutes1h = 1;
+constexpr uint16_t kHistoryPoints1h = 60;
+constexpr uint16_t kHistoryHours30d = 720;
+constexpr uint16_t kHistoryPeriodMinutes30d = 180;
+constexpr uint16_t kHistoryPoints30d = 240;
+constexpr int kRangeButtonWidth = popup_layout::scale(92);
+constexpr int kRangeButtonHeight = popup_layout::kNavHeight;
+constexpr int kRangeButtonGap = popup_layout::scale(10);
+constexpr size_t kBinaryMaxSegments = 96;
+constexpr size_t kBinaryMaxTimelineBins = 768;
+constexpr size_t kBinaryMaxActivityEntries = 96;
+constexpr size_t kStateHistoryMaxPaletteEntries = 16;
+#if defined(DEVICE_LAYOUT_480X480)
+constexpr int kBinaryTimelineHeight = 22;
+constexpr int kBinaryActivityRowHeight = 42;
+#elif defined(DEVICE_LAYOUT_1024X600)
+constexpr int kBinaryTimelineHeight = 24;
+constexpr int kBinaryActivityRowHeight = 42;
+#else
+constexpr int kBinaryTimelineHeight = 30;
+constexpr int kBinaryActivityRowHeight = 50;
+#endif
+// Bound the reusable rows by the available body, including one partial row
+// during scrolling. Taller viewports must not stop rendering after five rows.
+constexpr int kBinaryActivityViewportLimit = std::max(
+    popup_layout::kBodyHeight,
+    popup_layout::kNavY - popup_layout::kValueY - popup_layout::kValueHeight -
+        2 * popup_layout::kCardPad);
+constexpr int kBinaryActivityPoolRows =
+    (kBinaryActivityViewportLimit + kBinaryActivityRowHeight - 1) /
+        kBinaryActivityRowHeight + 1;
+constexpr uint32_t kBinaryActiveColor = 0xFFC107;
+constexpr uint32_t kBinaryInactiveColor = 0x8B8E96;
+constexpr uint32_t kBinaryUnknownColor = 0x555861;
+constexpr uint32_t kBinaryUnavailableColor = 0x34363C;
+constexpr uint32_t kStateHistoryRefreshMinMs24h = 60000;
+constexpr uint32_t kStateHistoryRefreshMinMs7d = 300000;
+constexpr uint32_t kStateHistoryColors[] = {
+    0x4C74D9, 0xF6C148, 0x43A047, 0xAB47BC,
+    0x26A69A, 0xEF6C63, 0x5C6BC0, 0xEC8F3A,
+    0x66BB6A, 0x8D6E63, 0x29B6F6, 0xD45A92,
+};
+#if defined(DEVICE_LAYOUT_480X480)
+constexpr int kContentLiftY = 6;
+#else
+constexpr int kContentLiftY = 0;
+#endif
+// Graph readout cursor: a thin white line and, on the numeric chart, a white
+// dot with a ring in the card color; before the first touch only the dot, in
+// the line's color (issue #139). The short state timeline also accepts
+// touches slightly above and below its bar.
+constexpr int kReadoutLineWidth = std::max(1, popup_layout::scale(2));
+constexpr int kReadoutDotSize = popup_layout::scale(16);
+constexpr int kReadoutDotRing = std::max(2, popup_layout::scale(3));
+constexpr int kTimelineTouchSlop = popup_layout::scale(24);
+constexpr uint8_t kReadoutNone = 0;
+constexpr uint8_t kReadoutChart = 1;
+constexpr uint8_t kReadoutTimeline = 2;
+// Readout times need a synchronized clock (2024-01-01 or later).
+constexpr uint64_t kReadoutMinEpoch = 1704067200ULL;
+
+enum class SensorHistoryRange : uint8_t {
+  Day24,
+  Day7,
+  Hours6,  // numeric graphs only: the Bridge's state histories know 24 h and 7 d
+  Hour1,   // numeric graphs only
+  Day30,   // numeric graphs only
+};
+
+struct HistoryRangeConfig {
+  uint16_t hours;
+  uint16_t period_minutes;
+  uint16_t points;
+};
+
+struct SensorPopupContext {
+  String entity_id;
+  String unit;
+  bool lock_unit = false;
+  uint8_t decimals = 0xFF;
+  uint32_t bg_color = 0;
+  SensorHistoryRange history_range = SensorHistoryRange::Day24;
+  SensorHistoryRange editable_requested_range = SensorHistoryRange::Day24;
+  bool history_loaded = false;
+  uint32_t history_loaded_ms = 0;
+  uint32_t history_fingerprint = 0;
+  uint32_t history_request_fingerprint = 0;
+  String history_language;
+  String history_kind, history_unit;
+  lv_obj_t* overlay = nullptr;
+  lv_obj_t* card = nullptr;
+  lv_obj_t* title_label = nullptr;
+  lv_obj_t* icon_label = nullptr;
+  lv_obj_t* close_button = nullptr;
+  lv_obj_t* value_label = nullptr;
+  lv_obj_t* value_unit_label = nullptr;  // the holder's unit (value_unit.h)
+  lv_obj_t* value_box = nullptr;
+  lv_obj_t* control_row = nullptr;
+  EditableControl* control = nullptr;
+  bool editable = false;
+  String editable_kind, editable_state, editable_history_id;
+  uint32_t editable_generation = 0;
+  bool editable_available = false;
+  lv_obj_t* body_box = nullptr;
+  lv_obj_t* range_row = nullptr;
+  lv_obj_t* range_day_btn = nullptr;
+  lv_obj_t* range_week_btn = nullptr;
+  lv_obj_t* range_hours_btn = nullptr;
+  lv_obj_t* range_hour_btn = nullptr;
+  lv_obj_t* range_month_btn = nullptr;
+  lv_obj_t* chart = nullptr;
+  int chart_height = kChartHeight;
+  lv_chart_series_t* series = nullptr;
+  lv_obj_t* y_max_label = nullptr;
+  lv_obj_t* y_min_label = nullptr;
+  lv_obj_t* y_zero_label = nullptr;
+  lv_obj_t* time_labels[kTimeAxisMarkerCount] = {};
+  // The time labels' places along the graph (0..1), for its time lines.
+  float time_fracs[kTimeAxisMarkerCount] = {};
+  uint8_t time_count = 0;
+  lv_obj_t* chart_wrap = nullptr;
+  uint16_t point_count = kHistoryPoints24h;
+  bool binary_mode = false;
+  bool state_history_mode = false;
+  bool binary_available = true;
+  bool binary_icon_override = false;
+  String icon_colors;
+  bool forced_icon = false;
+  uint32_t forced_icon_color = 0xFFFFFF;
+  uint32_t forced_icon_glyph = 0;
+  String binary_state;
+  String state_history_value;
+  String binary_device_class;
+  uint64_t binary_last_changed = 0;
+  lv_obj_t* binary_body = nullptr;
+  lv_obj_t* binary_history_title = nullptr;
+  lv_obj_t* binary_timeline = nullptr;
+  lv_obj_t* binary_history_status = nullptr;
+  lv_obj_t* binary_activity_title = nullptr;
+  lv_obj_t* binary_activity_date = nullptr;
+  lv_obj_t* binary_activity_status = nullptr;
+  lv_obj_t* binary_activity_viewport = nullptr;
+  lv_obj_t* binary_activity_spacer = nullptr;
+  lv_obj_t* binary_activity_rows[kBinaryActivityPoolRows] = {};
+  lv_obj_t* binary_activity_lines[kBinaryActivityPoolRows] = {};
+  lv_obj_t* binary_activity_dots[kBinaryActivityPoolRows] = {};
+  lv_obj_t* binary_activity_states[kBinaryActivityPoolRows] = {};
+  lv_obj_t* binary_activity_times[kBinaryActivityPoolRows] = {};
+  lv_obj_t* binary_activity_dividers[kBinaryActivityPoolRows] = {};
+  lv_obj_t* binary_time_labels[kTimeAxisMarkerCount] = {};
+  uint64_t binary_range_start = 0;
+  uint64_t binary_range_end = 0;
+  uint32_t state_history_last_request_ms = 0;
+  bool state_history_refresh_pending = false;
+  // The history stays with the resident popup until the next response, so its
+  // buffers (up to 96 segments and 96 activity rows, several KB) live in PSRAM:
+  // in the internal heap they fragmented the S3's 44 KB after a few openings.
+  struct BinarySegment {
+    uint64_t start = 0;
+    uint64_t end = 0;
+    uint8_t state = 2;
+    String value;
+  };
+  PsVector<BinarySegment> binary_segments;
+  PsVector<uint8_t> binary_timeline_bins;
+  PsVector<String> state_history_palette;
+  bool state_history_palette_complete = true;
+  struct BinaryActivityEntry {
+    uint64_t timestamp = 0;
+    uint8_t state = 2;
+    String value;
+  };
+  PsVector<BinaryActivityEntry> binary_activity;
+  size_t binary_activity_first_row = kBinaryMaxActivityEntries;
+  size_t binary_activity_row_indices[kBinaryActivityPoolRows] = {};
+  uint32_t binary_activity_date_key = 0;
+  // Graph readout in the old value row. The texts are static label buffers,
+  // so dragging allocates nothing; the cursor is drawn by its graph object.
+  PopupGraphScrub readout;
+  lv_obj_t* readout_time_label = nullptr;
+  lv_obj_t* readout_value_label = nullptr;
+  lv_obj_t* readout_unit_label = nullptr;
+  uint8_t readout_kind = kReadoutNone;
+  bool readout_band_raised = false;
+  int32_t readout_point = -1;
+  uint64_t readout_from = 0;
+  uint64_t readout_to = 0;
+  int32_t readout_x = 0;
+  int32_t readout_y = 0;
+  int32_t readout_top = 0;
+  int32_t readout_bottom = 0;
+  // Sensors keep the readout after release, at the finger's last position
+  // (x in the graph). It follows the newest point while it shows that point:
+  // on opening, after a range change and while new data arrives.
+  bool readout_latest = true;
+  int32_t readout_pin_x = 0;
+  // Issue #139: until a finger reads the graph, the newest point shows only
+  // as a dot in the line's color with its value above; the cursor line comes
+  // with the first touch and stays until the readout is reset (opening,
+  // range change, hiding).
+  bool readout_touched = false;
+  // A warm opening with retained history shows the newest point after its
+  // first frame, when the graph has its layout.
+  bool readout_refresh_pending = false;
+  char readout_time_text[72] = "";
+  char readout_value_text[176] = "";
+  // Unscaled history values in PSRAM; the chart keeps scaled integers.
+  float* history_values = nullptr;
+  size_t history_values_capacity = 0;
+  size_t history_values_count = 0;
+  int32_t chart_scale = 1;
+  uint64_t chart_range_start = 0;
+  uint64_t chart_range_end = 0;
+  // The graph's picture (graph_picture: area, dashed lines and line) in
+  // RGB565 in PSRAM, computed again only when the line, the colors or the
+  // size change (area_graph::picture_key); the line's points and its top
+  // per column beside it.
+  uint16_t* area_pixels = nullptr;
+  size_t area_capacity = 0;
+  int16_t* area_tops = nullptr;
+  size_t area_tops_capacity = 0;
+  area_graph::Point* area_points = nullptr;
+  size_t area_points_capacity = 0;
+  lv_image_dsc_t area_image = {};
+  uint32_t area_key = 0;
+  // Fraction digits of the current numeric state; readouts of history points
+  // use the header's precision when no fixed decimals are configured.
+  int8_t value_fraction_digits = -1;
+};
+
+struct PendingValueUpdate {
+  String entity_id;
+  String value;
+  String unit;
+  uint8_t decimals = 0xFF;
+  bool valid = false;
+};
+
+struct PendingHistoryUpdate {
+  String entity_id;
+  // Kept until the next response; an Arduino String would hold its buffer
+  // (several KB) in the internal heap.
+  PsString payload;
+  bool valid = false;
+};
+
+struct PendingBinaryStateUpdate {
+  String entity_id;
+  String state;
+  String device_class;
+  String icon_name;
+  uint64_t last_changed = 0;
+  bool available = true;
+  bool valid = false;
+};
+
+static SensorPopupContext* g_sensor_popup_ctx = nullptr;
+static PendingValueUpdate g_pending_value;
+static PendingHistoryUpdate g_pending_history;
+static PendingBinaryStateUpdate g_pending_binary_state;
+static bool g_pending_icon_refresh = false;
+static PopupFirstFrame g_sensor_first_frame;
+static SensorPopupInit g_pending_sensor_init;
+static bool g_sensor_open_pending = false;
+// A numeric graph's history asked for when the popup opened, not after its
+// first frame (request_history_early).
+static bool g_sensor_early_history = false;
+
+static void ensure_binary_view(SensorPopupContext* ctx);
+static void layout_editable_history(SensorPopupContext* ctx);
+static int editable_control_top(const SensorPopupContext* ctx);
+static void clear_binary_history(SensorPopupContext* ctx);
+static void clear_sensor_readout(SensorPopupContext* ctx);
+static void refresh_sensor_readout(SensorPopupContext* ctx);
+static void refresh_binary_activity_rows(SensorPopupContext* ctx,
+                                         bool force = false);
+static void update_binary_state(SensorPopupContext* ctx,
+                                const String& state,
+                                bool available,
+                                const String& device_class,
+                                uint64_t last_changed,
+                                const String& icon_name);
+static String normalize_state_live_value(const String& value);
+static String normalize_state_history_value(const String& value);
+
+static HistoryRangeConfig get_history_range_config(SensorHistoryRange range) {
+  switch (range) {
+    case SensorHistoryRange::Day7:
+      return {kHistoryHours7d, kHistoryPeriodMinutes7d, kHistoryPoints7d};
+    case SensorHistoryRange::Hours6:
+      return {kHistoryHours6h, kHistoryPeriodMinutes6h, kHistoryPoints6h};
+    case SensorHistoryRange::Hour1:
+      return {kHistoryHours1h, kHistoryPeriodMinutes1h, kHistoryPoints1h};
+    case SensorHistoryRange::Day30:
+      return {kHistoryHours30d, kHistoryPeriodMinutes30d, kHistoryPoints30d};
+    case SensorHistoryRange::Day24:
+    default:
+      return {kHistoryHours24h, kHistoryPeriodMinutes24h, kHistoryPoints24h};
+  }
+}
+
+static const char* get_weekday_abbrev(uint8_t wday) {
+  if (wday > 6) wday = 0;
+  return i18n::locale(
+             configManager.getConfig().language).weather_weekdays_short[wday];
+}
+
+static const lv_font_t* get_value_font() {
+#if defined(DEVICE_LAYOUT_480X480)
+  return &ui_font_24;
+#else
+  return popup_layout::font32();
+#endif
+}
+
+static void set_label_style(lv_obj_t* lbl, lv_color_t color, const lv_font_t* font) {
+  if (!lbl) return;
+  lv_obj_set_style_text_color(lbl, color, 0);
+  if (font) {
+    lv_obj_set_style_text_font(lbl, font, 0);
+  }
+}
+
+static bool is_popup_visible(SensorPopupContext* ctx) {
+  if (!ctx || !ctx->card) return false;
+  return !lv_obj_has_flag(ctx->card, LV_OBJ_FLAG_HIDDEN);
+}
+
+static bool apply_decimals(String& value, uint8_t decimals) {
+  const char* language = configManager.getConfig().language;
+  if (decimals == 0xFF) {
+    String localized = i18n::localize_numeric_text(language, value);
+    const bool changed = localized != value;
+    value = localized;
+    return changed;
+  }
+  String normalized = value;
+  normalized.replace(",", ".");
+  char* end = nullptr;
+  float f = strtof(normalized.c_str(), &end);
+  if (!end || end == normalized.c_str()) return false;
+  if (isnan(f) || isinf(f)) return false;
+  uint8_t d = decimals > 6 ? 6 : decimals;
+  value = i18n::format_number(language, f, d);
+  return true;
+}
+
+static String sensor_value_display(const String& value, uint8_t decimals, bool categorical_state);
+
+static void set_label_text_if_changed(lv_obj_t* label, const char* text) {
+  if (!label || !text) return;
+  if (strcmp(lv_label_get_text(label), text) != 0) lv_label_set_text(label, text);
+}
+
+// Digits after the decimal separator of a numeric state, or -1. History points
+// are rounded to three decimals, so more digits would only show zeros.
+static int8_t numeric_fraction_digits(const String& value) {
+  const char* text = value.c_str();
+  while (*text == ' ') ++text;
+  if (*text == '-' || *text == '+') ++text;
+  bool digits = false;
+  while (*text >= '0' && *text <= '9') { ++text; digits = true; }
+  int8_t fraction = 0;
+  if (*text == '.' || *text == ',') {
+    ++text;
+    while (*text >= '0' && *text <= '9') { ++text; ++fraction; digits = true; }
+  }
+  while (*text == ' ') ++text;
+  if (!digits || *text) return -1;
+  return fraction > 3 ? 3 : fraction;
+}
+
+// One count of decimals for the header, the readout and the axis (user
+// 2026-10-26: they showed 0, 2 and 1): the opening tile's setting, else the
+// digits Home Assistant sends with the state (the header shows it as sent),
+// else a whole number or one decimal.
+static uint8_t popup_digits(const SensorPopupContext* ctx, float value) {
+  const uint8_t decimals = ctx->editable ? 0xFF : ctx->decimals;
+  if (decimals != 0xFF && decimals <= 6) return decimals;
+  if (ctx->value_fraction_digits >= 0) return static_cast<uint8_t>(ctx->value_fraction_digits);
+  return fabsf(value - roundf(value)) < 0.05f ? 0 : 1;
+}
+
+// The shared popup header shows this hidden label's text as the current value.
+// The tile's per-tile icon colors (tile_icon_colors.h) color the header icon
+// like the tile icon: the color bar or state colors for the current state,
+// else the fixed color, else `fallback`. The shell copies the icon color into
+// the header, so the disc glow and the card border follow it.
+static bool popup_icon_state_known(const String& raw) {
+  String state = raw;
+  state.trim();
+  state.toLowerCase();
+  return state.length() && state != "unavailable" && state != "unknown" &&
+         state != "none" && state != "null";
+}
+
+static void update_range_buttons(SensorPopupContext* ctx);
+
+static void apply_popup_icon_color(SensorPopupContext* ctx, bool known, const char* state,
+                                   const char* display, lv_color_t fallback) {
+  if (!ctx || !ctx->icon_label) return;
+  // The matching rule's own icon as on the tile (tile_rule_icon.h): own-state
+  // rules for this state, else the forcing rule's icon from the opening.
+  if (ctx->forced_icon) {
+    tile_rule_icon::show_codepoint(ctx->icon_label, ctx->forced_icon_glyph);
+  } else if (tile_icon_colors::own_state_colors_icon(ctx->icon_colors.c_str())) {
+    tile_rule_icon::show(ctx->icon_label, tile_icon_colors::state_icon(ctx->icon_colors.c_str(),
+                                                                       known && ctx->icon_colors.length(), state,
+                                                                       display));
+  }
+  // Own-state rules as on the tile (tile_icon_colors::state_icon_color); rules
+  // on another entity (or switched off) leave the fixed color, and a forced
+  // tile color wins.
+  const lv_color_t color =
+      ctx->forced_icon ? lv_color_hex(ctx->forced_icon_color)
+                       : lv_color_hex(tile_icon_colors::state_icon_color(
+                             ctx->icon_colors.c_str(), known && ctx->icon_colors.length(), state,
+                             display, lv_color_to_u32(fallback) & 0xFFFFFF));
+  if (!lv_color_eq(lv_obj_get_style_text_color(ctx->icon_label, LV_PART_MAIN), color)) {
+    lv_obj_set_style_text_color(ctx->icon_label, color, 0);
+    // The range buttons and the editor surfaces take the control fill, which
+    // follows the icon.
+    update_range_buttons(ctx);
+    editable_control_follow_colors(ctx->control);
+    // The graph's line and area follow the icon's color.
+    if (ctx->chart_wrap) lv_obj_invalidate(ctx->chart_wrap);
+  }
+}
+
+// Number, Select and Date/Time: the same known-state rule as the tile
+// (refresh_editable_tile) with the displayed text for state colors.
+static void apply_editable_icon_color(SensorPopupContext* ctx, const EditableValue& value) {
+  const bool known = value.valid && value.has_state && value.available && value.state != "unknown";
+  apply_popup_icon_color(ctx, known, value.state.c_str(), editable_display_value(value).c_str(),
+                         lv_color_hex(ui_theme::text()));
+}
+
+// The header's value and its unit (value_unit.h: the unit a step smaller
+// after it, user 2026-10-26); every write to the holder comes here, so a
+// reused popup never keeps an old unit.
+static void show_header_value(SensorPopupContext* ctx, const String& value, const String& unit) {
+  if (!ctx || !ctx->value_label) return;
+  String shown_unit = value != "--" ? unit : String();
+  shown_unit.trim();
+  value_unit::show(ctx->value_label, ctx->value_unit_label, value, shown_unit);
+}
+
+static void update_value_label(SensorPopupContext* ctx, const String& value, const String& unit) {
+  if (!ctx || !ctx->value_label) return;
+  const bool categorical_state = ctx->state_history_mode && !ctx->binary_mode;
+  show_header_value(ctx, sensor_value_display(value, ctx->decimals, categorical_state), unit);
+  if (!ctx->binary_mode && !ctx->editable) {
+    apply_popup_icon_color(ctx, popup_icon_state_known(value), value.c_str(), nullptr,
+                           lv_color_hex(ui_theme::text()));
+  }
+  String display_unit = unit;
+  display_unit.trim();
+  ctx->unit = display_unit;
+  ctx->value_fraction_digits =
+      categorical_state ? -1 : numeric_fraction_digits(value);
+}
+
+// Header value text without its unit, shared by live updates and the first
+// frame of an opening.
+static String sensor_value_display(const String& value, uint8_t decimals, bool categorical_state) {
+  String display = categorical_state ? normalize_state_live_value(value)
+                                     : value;
+  if (!categorical_state) display.trim();
+  String lower = display;
+  lower.toLowerCase();
+  if (lower == "unavailable" || lower == "unknown" || lower == "none" || lower == "null") {
+    display = "--";
+  }
+  if (display.isEmpty()) {
+    display = "--";
+  }
+  if (!categorical_state && display.length() > 0 && display != "--" &&
+      !display.equalsIgnoreCase("unavailable")) {
+    apply_decimals(display, decimals);
+  }
+  return display;
+}
+
+static void style_range_button(SensorPopupContext* ctx, lv_obj_t* btn, bool active) {
+  if (!ctx || !btn) return;
+  const lv_color_t popup =
+      ctx->card ? lv_obj_get_style_bg_color(ctx->card, LV_PART_MAIN) : lv_color_hex(ui_theme::popup_card());
+  const lv_color_t icon =
+      ctx->icon_label ? lv_obj_get_style_text_color(ctx->icon_label, LV_PART_MAIN) : lv_color_hex(ui_theme::text());
+  lv_obj_t* label = lv_obj_get_child(btn, 0);
+  if (label) {
+    lv_obj_set_style_text_font(label, popup_layout::font24(), 0);
+    lv_obj_set_style_text_font(label, popup_layout::font24(), LV_STATE_PRESSED);
+  }
+  popup_nav_style::style_toggle(btn, label, popup, icon, active);
+}
+
+static void update_range_buttons(SensorPopupContext* ctx) {
+  if (!ctx) return;
+  const auto selected = ctx->editable ? ctx->editable_requested_range : ctx->history_range;
+  style_range_button(ctx, ctx->range_day_btn, selected == SensorHistoryRange::Day24);
+  style_range_button(ctx, ctx->range_week_btn, selected == SensorHistoryRange::Day7);
+  style_range_button(ctx, ctx->range_hours_btn, selected == SensorHistoryRange::Hours6);
+  style_range_button(ctx, ctx->range_hour_btn, selected == SensorHistoryRange::Hour1);
+  style_range_button(ctx, ctx->range_month_btn, selected == SensorHistoryRange::Day30);
+}
+
+}  // namespace
+
+// While open, the popup follows its tile's current background (a rules tint
+// that changes with the entity state); tile_icon_source calls this.
+void sensor_popup_follow_tile_color(uint32_t color) {
+  const ui_theme::SurfaceScope popup_scope = popup_surface::scope();
+  SensorPopupContext* ctx = g_sensor_popup_ctx;
+  if (!ctx || !ctx->card || lv_obj_has_flag(ctx->card, LV_OBJ_FLAG_HIDDEN) || ctx->bg_color == color) return;
+  ctx->bg_color = color;
+  lv_obj_set_style_bg_color(ctx->card, lv_color_hex(color), 0);
+  update_range_buttons(ctx);
+  editable_control_follow_colors(ctx->control);
+}
+
+namespace {
+
+static void set_range_buttons_visible(SensorPopupContext* ctx, bool visible) {
+  if (!ctx || !ctx->range_row) return;
+  if (visible) {
+    lv_obj_clear_flag(ctx->range_row, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_add_flag(ctx->range_row, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+// Numeric graphs offer 30D 7D 24H 6H 1H (issue #131, user 2026-10-29: five
+// ranges); binary, state and editable histories keep 24H and 7D, the two
+// ranges the Bridge answers for them. The row stays centred on its buttons.
+static void show_hours_button(SensorPopupContext* ctx, bool shown) {
+  if (!ctx || !ctx->range_row || !ctx->range_hours_btn) return;
+  const int buttons = shown ? 5 : 2;
+  lv_obj_set_width(ctx->range_row, kRangeButtonWidth * buttons + kRangeButtonGap * (buttons - 1));
+  for (lv_obj_t* btn : {ctx->range_month_btn, ctx->range_hours_btn, ctx->range_hour_btn}) {
+    if (!btn) continue;
+    if (shown) lv_obj_remove_flag(btn, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(btn, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+static bool extract_numeric(JsonVariant v, float& out) {
+  if (v.isNull()) return false;
+
+  if (v.is<const char*>()) {
+    const char* text = v.as<const char*>();
+    if (!text || !*text) return false;
+    char* end = nullptr;
+    out = strtof(text, &end);
+    if (end == text) return false;
+    return isfinite(out);
+  }
+
+  if (v.is<float>() || v.is<double>() || v.is<int>() || v.is<long>() ||
+      v.is<unsigned long>() || v.is<long long>() || v.is<unsigned long long>()) {
+    out = v.as<float>();
+    return isfinite(out);
+  }
+
+  return false;
+}
+
+static void apply_sensor_header(SensorPopupContext* ctx, const SensorPopupInit& init) {
+  if (!ctx) return;
+  if (ctx->card) {
+    uint32_t color = init.bg_color ? init.bg_color : ui_theme::popup_card();
+    lv_obj_set_style_bg_color(ctx->card, lv_color_hex(color), 0);
+  }
+  if (ctx->title_label) {
+    hometiles_title::set(ctx->title_label, init.title.c_str());
+  }
+  if (ctx->icon_label) {
+    // The reused header forgets the last tile's rule icon.
+    tile_rule_icon::forget(ctx->icon_label);
+    String icon_name = init.icon_name;
+    icon_name.trim();
+    if (!icon_name.length() || isMdiIconDisabled(icon_name)) {
+      lv_label_set_text(ctx->icon_label, "");
+      lv_obj_add_flag(ctx->icon_label, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      String icon_char = getMdiChar(icon_name);
+      if (!icon_char.isEmpty()) {
+        lv_label_set_text(ctx->icon_label, icon_char.c_str());
+        lv_obj_clear_flag(ctx->icon_label, LV_OBJ_FLAG_HIDDEN);
+      } else {
+        lv_label_set_text(ctx->icon_label, "");
+        lv_obj_add_flag(ctx->icon_label, LV_OBJ_FLAG_HIDDEN);
+      }
+    }
+  }
+  ctx->icon_colors = init.icon_colors;
+  ctx->forced_icon = init.forced_icon;
+  ctx->forced_icon_color = init.forced_icon_color;
+  ctx->forced_icon_glyph = init.forced_icon_glyph;
+  if (ctx->icon_label) {
+    lv_obj_set_style_text_color(ctx->icon_label, lv_color_hex(ui_theme::text()), 0);
+  }
+  popup_layout::alignHeader(ctx->card, ctx->title_label, ctx->icon_label);
+}
+
+static void apply_init_to_context(SensorPopupContext* ctx, const SensorPopupInit& init,
+                                  bool reuse_history = false, bool apply_header = true) {
+  if (!ctx) return;
+  editable_control_close(ctx->control);
+  ctx->editable = init.editable;
+  const EditableValue editable_value = init.editable
+      ? parse_editable_value(haBridgeConfig.findEditableValue(init.entity_id)) : EditableValue{};
+  ctx->editable_kind = editable_value.kind;
+  ctx->editable_state = init.editable ? editable_value.state : init.value;
+  ctx->editable_generation = editable_value_generation();
+  ctx->editable_available = editable_value.available;
+  ctx->editable_history_id = "";
+  ctx->editable_requested_range = SensorHistoryRange::Day24;
+  if (init.editable) {
+    show_header_value(ctx, editable_display_number(editable_value), editable_display_unit(editable_value));
+    apply_editable_icon_color(ctx, editable_value);
+    ctx->value_fraction_digits = numeric_fraction_digits(editable_value.state);
+  }
+  ctx->entity_id = init.entity_id;
+  ctx->lock_unit = init.lock_unit;
+  ctx->decimals = init.decimals;
+  ctx->bg_color = init.bg_color;
+  ctx->binary_mode = init.binary_mode;
+  ctx->state_history_mode = init.editable || init.binary_mode || init.state_history_mode;
+  ctx->binary_available = init.binary_available;
+  ctx->binary_icon_override = init.binary_icon_override;
+  ctx->binary_device_class = init.binary_device_class;
+  ctx->binary_last_changed = init.binary_last_changed;
+  if (apply_header) apply_sensor_header(ctx, init);
+  if (ctx->state_history_mode) {
+    if (!reuse_history) ensure_binary_view(ctx);
+    if (ctx->chart_wrap && (!ctx->editable || ctx->editable_kind != "number"))
+      lv_obj_add_flag(ctx->chart_wrap, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->binary_body) lv_obj_clear_flag(ctx->binary_body, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->range_day_btn) {
+      lv_obj_t* label = lv_obj_get_child(ctx->range_day_btn, 0);
+      if (label) {
+        lv_label_set_text(label, i18n::binary_sensor_label(
+                                     configManager.getConfig().language, 6));
+      }
+    }
+    if (ctx->range_week_btn) {
+      lv_obj_t* label = lv_obj_get_child(ctx->range_week_btn, 0);
+      if (label) {
+        lv_label_set_text(label, i18n::binary_sensor_label(
+                                     configManager.getConfig().language, 7));
+      }
+    }
+    show_hours_button(ctx, false);
+    if (ctx->binary_mode) {
+      update_binary_state(ctx, init.value, init.binary_available,
+                          init.binary_device_class, init.binary_last_changed,
+                          init.icon_name);
+    } else {
+      ctx->state_history_value = normalize_state_live_value(ctx->editable_state);
+      if (ctx->editable) ctx->unit = editable_value.unit;
+      else update_value_label(ctx, init.value, init.unit);
+    }
+  } else {
+    if (ctx->chart_wrap) lv_obj_clear_flag(ctx->chart_wrap, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->binary_body) lv_obj_add_flag(ctx->binary_body, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->range_day_btn) {
+      lv_obj_t* label = lv_obj_get_child(ctx->range_day_btn, 0);
+      if (label) lv_label_set_text(label, "24H");
+    }
+    if (ctx->range_week_btn) {
+      lv_obj_t* label = lv_obj_get_child(ctx->range_week_btn, 0);
+      if (label) lv_label_set_text(label, "7D");
+    }
+    show_hours_button(ctx, true);
+    update_value_label(ctx, init.value, init.unit);
+  }
+  // A warm history retains its geometry unless the new header needs more
+  // control clearance. The hidden Sensor value label is unused by editors.
+  if (!reuse_history || (ctx->editable && (!ctx->control_row ||
+      lv_obj_get_style_y(ctx->control_row, LV_PART_MAIN) != editable_control_top(ctx))))
+    layout_editable_history(ctx);
+  if (ctx->editable) {
+    lv_obj_add_flag(ctx->value_box, LV_OBJ_FLAG_HIDDEN);
+    editable_control_open(ctx->control, ctx->entity_id);
+  } else {
+    lv_obj_remove_flag(ctx->value_box, LV_OBJ_FLAG_HIDDEN);
+    ctx->history_language = configManager.getConfig().language;
+    ctx->history_unit = init.unit;
+  }
+}
+
+// Measure text without changing label geometry or forcing a screen-wide layout.
+static lv_coord_t measure_label_text_width(lv_obj_t* label) {
+  if (!label) return 0;
+  const char* txt = lv_label_get_text(label);
+  if (!txt || !*txt) return 0;
+  lv_point_t size;
+  lv_text_get_size(&size, txt, lv_obj_get_style_text_font(label, LV_PART_MAIN),
+                   lv_obj_get_style_text_letter_space(label, LV_PART_MAIN),
+                   lv_obj_get_style_text_line_space(label, LV_PART_MAIN),
+                   LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+  // A unit after the text (value_unit.h) keeps its room on the right as the
+  // label's right padding: counted once (twice left a gap of the unit's
+  // width before the graph once the labels were left-aligned).
+  return size.x + lv_obj_get_style_pad_left(label, LV_PART_MAIN) +
+         lv_obj_get_style_pad_right(label, LV_PART_MAIN);
+}
+
+static bool get_valid_local_time(struct tm& out) {
+  if (!getLocalTime(&out, 0)) return false;
+  const int year = out.tm_year + 1900;
+  const int month = out.tm_mon + 1;
+  const int day = out.tm_mday;
+  if (year < 2024 || year > 2100) return false;
+  if (month < 1 || month > 12) return false;
+  if (day < 1 || day > 31) return false;
+  return true;
+}
+
+static String format_time_axis_label(int hour24) {
+  int normalized = hour24 % 24;
+  if (normalized < 0) normalized += 24;
+  const DeviceConfig& cfg = configManager.getConfig();
+  const uint8_t time_format =
+      clock_tile::resolve_time_format(clock_tile::TIME_FORMAT_AUTO, cfg.global_time_format, cfg.language);
+  if (time_format == clock_tile::TIME_FORMAT_24H) {
+    return String(normalized) + i18n::locale(cfg.language).hour_axis_suffix;
+  }
+
+  int hour12 = normalized % 12;
+  if (hour12 == 0) hour12 = 12;
+  return String(hour12) + (normalized < 12 ? " AM" : " PM");
+}
+
+static String format_day_axis_label(time_t ts) {
+  struct tm timeinfo;
+#ifdef _WIN32
+  localtime_s(&timeinfo, &ts);
+#else
+  localtime_r(&ts, &timeinfo);
+#endif
+  return String(get_weekday_abbrev(static_cast<uint8_t>(timeinfo.tm_wday)));
+}
+
+static bool get_day7_axis_base(time_t& now_local, time_t& range_start, struct tm& today_midnight_tm) {
+  struct tm now_tm;
+  if (!get_valid_local_time(now_tm)) return false;
+
+  now_local = mktime(&now_tm);
+  if (now_local <= 0) return false;
+
+  range_start = now_local - static_cast<time_t>(kHistoryHours7d) * 60 * 60;
+  today_midnight_tm = now_tm;
+  today_midnight_tm.tm_hour = 0;
+  today_midnight_tm.tm_min = 0;
+  today_midnight_tm.tm_sec = 0;
+  return true;
+}
+
+static time_t next_local_midnight_after(time_t ts) {
+  struct tm timeinfo;
+#ifdef _WIN32
+  localtime_s(&timeinfo, &ts);
+#else
+  localtime_r(&ts, &timeinfo);
+#endif
+  timeinfo.tm_hour = 0;
+  timeinfo.tm_min = 0;
+  timeinfo.tm_sec = 0;
+  timeinfo.tm_mday += 1;
+  // The next day may have another DST than `ts`: with the old flag the day
+  // after a change started an hour early, and 7D showed that day twice
+  // ("Sun Sun", 2026-10-25).
+  timeinfo.tm_isdst = -1;
+  return mktime(&timeinfo);
+}
+
+// The next full hour after `ts` divisible by `step` (a divisor of 24).
+static time_t next_local_boundary_after(time_t ts, int step) {
+  struct tm timeinfo;
+#ifdef _WIN32
+  localtime_s(&timeinfo, &ts);
+#else
+  localtime_r(&ts, &timeinfo);
+#endif
+
+  const int current_hour = timeinfo.tm_hour;
+  int next_hour = ((current_hour / step) + 1) * step;
+  if (next_hour >= 24) {
+    next_hour -= 24;
+    timeinfo.tm_mday += 1;
+  }
+
+  timeinfo.tm_hour = next_hour;
+  timeinfo.tm_min = 0;
+  timeinfo.tm_sec = 0;
+  timeinfo.tm_isdst = -1;  // as next_local_midnight_after
+  return mktime(&timeinfo);
+}
+
+// Hour labels at every `step` full hours of the last `hours` hours: 24H
+// every 6 hours, 6H every 2 hours.
+static int calc_hours_axis(uint16_t hours, int step, String out_labels[], float out_frac[], int max_markers) {
+  struct tm now_tm;
+  if (!get_valid_local_time(now_tm)) return 0;
+
+  time_t now_local = mktime(&now_tm);
+  if (now_local <= 0) return 0;
+
+  const time_t range_start = now_local - static_cast<time_t>(hours) * 60 * 60;
+  const float span = static_cast<float>(now_local - range_start);
+  if (span <= 0.0f) return 0;
+
+  int count = 0;
+  time_t boundary = next_local_boundary_after(range_start, step);
+  while (boundary < now_local && count < max_markers) {
+    struct tm boundary_tm;
+#ifdef _WIN32
+    localtime_s(&boundary_tm, &boundary);
+#else
+    localtime_r(&boundary, &boundary_tm);
+#endif
+    out_labels[count] = format_time_axis_label(boundary_tm.tm_hour);
+    out_frac[count] = static_cast<float>(boundary - range_start) / span;
+    ++count;
+    boundary = next_local_boundary_after(boundary, step);
+  }
+
+  return count;
+}
+
+static int calc_day7_label_axis(String out_labels[], float out_frac[], int max_markers) {
+  time_t now_local = 0;
+  time_t range_start = 0;
+  struct tm today_midnight_tm;
+  if (!get_day7_axis_base(now_local, range_start, today_midnight_tm)) return 0;
+
+  const float span = static_cast<float>(now_local - range_start);
+  if (span <= 0.0f) return 0;
+
+  int count = 0;
+  time_t segment_start = range_start;
+  while (segment_start < now_local && count < max_markers) {
+    time_t segment_end = next_local_midnight_after(segment_start);
+    if (segment_end > now_local) segment_end = now_local;
+    if (segment_end <= segment_start) break;
+
+    const float center = static_cast<float>(segment_start - range_start) +
+                         (static_cast<float>(segment_end - segment_start) * 0.5f);
+    out_labels[count] = format_day_axis_label(segment_start);
+    out_frac[count] = center / span;
+    ++count;
+    segment_start = segment_end;
+  }
+
+  return count;
+}
+
+// The 7D graph's day boundaries (local midnights) as fractions of the
+// range, for its time lines between the days.
+static int calc_day7_boundary_axis(float out_frac[], int max_markers) {
+  time_t now_local = 0;
+  time_t range_start = 0;
+  struct tm today_midnight_tm;
+  if (!get_day7_axis_base(now_local, range_start, today_midnight_tm)) return 0;
+
+  const float span = static_cast<float>(now_local - range_start);
+  if (span <= 0.0f) return 0;
+
+  int count = 0;
+  time_t boundary = next_local_midnight_after(range_start);
+  while (boundary < now_local && count < max_markers) {
+    if (boundary > range_start) {
+      out_frac[count] = static_cast<float>(boundary - range_start) / span;
+      ++count;
+    }
+    boundary = next_local_midnight_after(boundary);
+  }
+  return count;
+}
+
+static bool readout_twelve_hour();
+
+// 1H: a line every quarter hour with its clock time under it.
+static int calc_quarter_axis(String out_labels[], float out_frac[], int max_markers) {
+  struct tm now_tm;
+  if (!get_valid_local_time(now_tm)) return 0;
+  const time_t now_local = mktime(&now_tm);
+  if (now_local <= 0) return 0;
+  constexpr time_t kQuarter = 15 * 60;
+  const time_t range_start = now_local - static_cast<time_t>(kHistoryHours1h) * 60 * 60;
+  const float span = static_cast<float>(now_local - range_start);
+  int count = 0;
+  for (time_t mark = (range_start / kQuarter + 1) * kQuarter; mark < now_local && count < max_markers;
+       mark += kQuarter) {
+    struct tm mark_tm;
+#ifdef _WIN32
+    localtime_s(&mark_tm, &mark);
+#else
+    localtime_r(&mark, &mark_tm);
+#endif
+    char text[16] = "";
+    popup_graph_readout::append_clock(text, sizeof(text), 0, mark_tm, readout_twelve_hour(), nullptr);
+    out_labels[count] = text;
+    out_frac[count] = static_cast<float>(mark - range_start) / span;
+    ++count;
+  }
+  return count;
+}
+
+// The short date of a day in the configured language ("26. Okt.").
+static String short_date_label(const struct tm& day) {
+  const char* language = configManager.getConfig().language;
+  return i18n::format_short_date(language, day.tm_mday, i18n::weather_month_short(language, day.tm_mon + 1));
+}
+
+// 30D: a line at every first weekday 0:00 (Monday unless Settings >
+// Localization says otherwise) with its date under it, four or five like
+// 24H's labels; a line per day would be thirty.
+static int calc_day30_axis(String out_labels[], float out_frac[], int max_markers) {
+  struct tm now_tm;
+  if (!get_valid_local_time(now_tm)) return 0;
+  const time_t now_local = mktime(&now_tm);
+  if (now_local <= 0) return 0;
+  const time_t range_start = now_local - static_cast<time_t>(kHistoryHours30d) * 60 * 60;
+  const float span = static_cast<float>(now_local - range_start);
+  // A line at each week's first day: the panel's (Settings > Localization).
+  const int first_weekday = week_start::panel();
+  int count = 0;
+  for (time_t day = next_local_midnight_after(range_start); day < now_local && count < max_markers;
+       day = next_local_midnight_after(day)) {
+    struct tm day_tm;
+#ifdef _WIN32
+    localtime_s(&day_tm, &day);
+#else
+    localtime_r(&day, &day_tm);
+#endif
+    if (day_tm.tm_wday != first_weekday) continue;
+    out_labels[count] = short_date_label(day_tm);
+    out_frac[count] = static_cast<float>(day - range_start) / span;
+    ++count;
+  }
+  return count;
+}
+
+// Calculate time axis marker positions and labels.
+static int calc_time_axis(const SensorPopupContext* ctx, String out_labels[], float out_frac[], int max_markers) {
+  if (!ctx || max_markers < 1) return 0;
+
+  if (ctx->history_range == SensorHistoryRange::Day7) {
+    return calc_day7_label_axis(out_labels, out_frac, max_markers);
+  }
+  if (ctx->history_range == SensorHistoryRange::Hours6) {
+    return calc_hours_axis(kHistoryHours6h, 2, out_labels, out_frac, max_markers);
+  }
+  if (ctx->history_range == SensorHistoryRange::Hour1) return calc_quarter_axis(out_labels, out_frac, max_markers);
+  if (ctx->history_range == SensorHistoryRange::Day30) return calc_day30_axis(out_labels, out_frac, max_markers);
+
+  return calc_hours_axis(kHistoryHours24h, 6, out_labels, out_frac, max_markers);
+}
+
+// Indices of the series' highest and lowest point (the first of equals);
+// false without two points or with a flat line.
+static bool chart_extremes(const SensorPopupContext* ctx, uint32_t& high, uint32_t& low) {
+  const uint32_t count = ctx->chart && ctx->series ? lv_chart_get_point_count(ctx->chart) : 0;
+  const int32_t* values = count > 1 ? lv_chart_get_series_y_array(ctx->chart, ctx->series) : nullptr;
+  if (!values) return false;
+  uint32_t found = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    if (values[i] == LV_CHART_POINT_NONE) continue;
+    if (!found++) {
+      high = low = i;
+      continue;
+    }
+    if (values[i] > values[high]) high = i;
+    if (values[i] < values[low]) low = i;
+  }
+  return found > 1 && values[high] != values[low];
+}
+
+// The row of zero between the maximum's row `top` and the minimum's
+// `bottom`, or -1: only under a line that is not flat and crosses zero, a
+// label's height from both ends, so the zero line's label touches neither
+// of theirs (user 2026-10-27).
+static int32_t graph_zero_row(const SensorPopupContext* ctx, int32_t top, int32_t bottom) {
+  uint32_t high = 0, low = 0;
+  if (!chart_extremes(ctx, high, low)) return -1;
+  return area_graph::zero_row(ctx->chart, top, bottom, lv_font_get_line_height(popup_layout::font20()));
+}
+
+static String zero_label_text(const SensorPopupContext* ctx) {
+  return i18n::format_number(configManager.getConfig().language, 0.0f, popup_digits(ctx, 0.0f));
+}
+
+// The zero line's label, right-aligned in the width of the maximum's and the
+// minimum's and centered on its row; hidden without the line.
+static void place_zero_label(SensorPopupContext* ctx) {
+  if (!ctx || !ctx->y_zero_label || !ctx->chart) return;
+  const int32_t row = graph_zero_row(ctx, 0, lv_obj_get_content_height(ctx->chart));
+  if (row < 0) {
+    lv_obj_add_flag(ctx->y_zero_label, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+  value_unit::show(ctx->y_zero_label, zero_label_text(ctx), ctx->unit);
+  lv_obj_set_pos(ctx->y_zero_label, kGraphInset, row);
+  value_unit::place(ctx->y_zero_label);
+  lv_obj_remove_flag(ctx->y_zero_label, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Recalculate Y-axis layout based on actual label text widths.
+// Measures max/min labels, repositions guide lines and chart padding.
+static void update_y_axis_layout(SensorPopupContext* ctx) {
+  if (!ctx || !ctx->chart || !ctx->chart_wrap) return;
+  constexpr int kLabelGap = 16;   // gap between label right edge and the graph
+  constexpr int kMinAxisW = 10;   // minimum width even if labels empty
+  const int kAvailW = kCardWidth - (kCardPad * 2);
+
+  // Measure actual rendered text widths
+  lv_coord_t max_w = measure_label_text_width(ctx->y_max_label);
+  lv_coord_t min_w = measure_label_text_width(ctx->y_min_label);
+  // The zero line's label (place_zero_label) counts for the common width too.
+  lv_coord_t zero_w = 0;
+  if (ctx->y_zero_label && graph_zero_row(ctx, 0, lv_obj_get_content_height(ctx->chart)) >= 0) {
+    lv_obj_set_width(ctx->y_zero_label, LV_SIZE_CONTENT);
+    value_unit::show(ctx->y_zero_label, zero_label_text(ctx), ctx->unit);
+    zero_w = measure_label_text_width(ctx->y_zero_label);
+  }
+
+  lv_coord_t text_w = LV_MAX(LV_MAX(max_w, min_w), zero_w);
+  if (text_w < kMinAxisW) text_w = kMinAxisW;
+  int label_w = text_w + 2;  // text width + small safety margin
+  int axis_w = label_w + kLabelGap;  // label + visible gap before lines
+
+  // The labels and the graph keep the header circle's distance from the
+  // card's sides (mockup sensor-graph-2): kGraphInset on the left and right.
+  // The labels share one width and stand right-aligned in it, so their units
+  // form one column at the graph and the widest starts at the inset (user
+  // 2026-10-29: "0 W" stood left under "13231 W").
+  for (lv_obj_t* label : {ctx->y_max_label, ctx->y_min_label, ctx->y_zero_label}) {
+    if (!label) continue;
+    lv_obj_set_width(label, label_w);
+    lv_obj_set_x(label, kGraphInset);
+    value_unit::place(label);
+  }
+
+  // Chart drawing starts directly after label area
+  int chart_left = kGraphInset + axis_w;
+  const int chart_right = kAvailW - kGraphInset;
+
+  // The chart object spans exactly the graph, so the line's round caps end
+  // flush with it.
+  lv_obj_set_x(ctx->chart, chart_left);
+  lv_obj_set_width(ctx->chart, std::max(10, chart_right - chart_left));
+  lv_obj_set_style_pad_left(ctx->chart, 0, 0);
+  lv_obj_set_style_pad_right(ctx->chart, 0, 0);
+  place_zero_label(ctx);
+
+  constexpr int kLabelOverhang = 12;
+
+  String labels[kTimeAxisMarkerCount];
+  float fracs[kTimeAxisMarkerCount];
+  int n = calc_time_axis(ctx, labels, fracs, kTimeAxisMarkerCount);
+  lv_coord_t time_label_widths[kTimeAxisMarkerCount] = {};
+
+  for (int i = 0; i < kTimeAxisMarkerCount; ++i) {
+    if (i < n && ctx->time_labels[i]) {
+      lv_label_set_text(ctx->time_labels[i], labels[i].c_str());
+      time_label_widths[i] = measure_label_text_width(ctx->time_labels[i]);
+    }
+  }
+
+  // Time labels along the graph, the last one kept inside the card (clamped
+  // below); faint lines at the times are part of the graph's picture
+  // (graph_picture): under the 24H and 6H labels, between the days of 7D.
+  ctx->time_count = 0;
+  int chart_draw_w = chart_right - chart_left;
+  if (chart_draw_w < 10) return;
+  if (ctx->history_range == SensorHistoryRange::Day7) {
+    ctx->time_count = static_cast<uint8_t>(calc_day7_boundary_axis(ctx->time_fracs, kTimeAxisMarkerCount));
+  } else {
+    for (int i = 0; i < n && i < kTimeAxisMarkerCount; ++i) ctx->time_fracs[i] = fracs[i];
+    ctx->time_count = static_cast<uint8_t>(std::min(n, kTimeAxisMarkerCount));
+  }
+
+  for (int i = 0; i < kTimeAxisMarkerCount; ++i) {
+    if (i < n) {
+      int label_x_anchor = chart_left + static_cast<int>(fracs[i] * chart_draw_w);
+      if (ctx->time_labels[i]) {
+        lv_coord_t lbl_w = time_label_widths[i];
+        int label_x = label_x_anchor - lbl_w / 2;
+        int min_x = chart_left - (lbl_w / 2);
+        if (min_x < kGraphInset) min_x = kGraphInset;
+        int max_x = chart_right - lbl_w;
+        if (max_x < min_x) max_x = min_x;
+        if (label_x < min_x) label_x = min_x;
+        if (label_x > max_x) label_x = max_x;
+        lv_obj_set_pos(
+            ctx->time_labels[i], label_x,
+            kLabelOverhang + ctx->chart_height + kTimeLabelGap);
+        lv_obj_clear_flag(ctx->time_labels[i], LV_OBJ_FLAG_HIDDEN);
+      }
+    } else {
+      if (ctx->time_labels[i]) lv_obj_add_flag(ctx->time_labels[i], LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+}
+
+static void clear_chart(SensorPopupContext* ctx, uint16_t points) {
+  if (!ctx || !ctx->chart || !ctx->series) return;
+  ctx->point_count = points;
+  ctx->history_values_count = 0;
+  ctx->readout_point = -1;
+  // A kept readout leaves with its data; the next history shows it again.
+  if (ctx->readout_kind == kReadoutChart) clear_sensor_readout(ctx);
+  lv_chart_set_point_count(ctx->chart, points);
+  lv_chart_set_all_value(ctx->chart, ctx->series, LV_CHART_POINT_NONE);
+  if (ctx->y_max_label) value_unit::show(ctx->y_max_label, "", "");
+  if (ctx->y_min_label) value_unit::show(ctx->y_min_label, "", "");
+  if (ctx->y_zero_label) lv_obj_add_flag(ctx->y_zero_label, LV_OBJ_FLAG_HIDDEN);
+  ctx->time_count = 0;
+  for (int i = 0; i < kTimeAxisMarkerCount; ++i) {
+    if (ctx->time_labels[i]) lv_obj_add_flag(ctx->time_labels[i], LV_OBJ_FLAG_HIDDEN);
+  }
+  // The dots at the extremes leave the chart's bounds.
+  if (ctx->chart_wrap) lv_obj_invalidate(ctx->chart_wrap);
+}
+
+static uint64_t extract_epoch(JsonVariantConst value) {
+  if (value.isNull()) return 0;
+  if (value.is<uint64_t>()) return value.as<uint64_t>();
+  if (value.is<unsigned long>()) return value.as<unsigned long>();
+  if (value.is<long long>()) {
+    const long long parsed = value.as<long long>();
+    return parsed > 0 ? static_cast<uint64_t>(parsed) : 0;
+  }
+  if (value.is<const char*>()) {
+    const char* text = value.as<const char*>();
+    if (!text || !*text) return 0;
+    char* end = nullptr;
+    const unsigned long long parsed = strtoull(text, &end, 10);
+    return end && end != text ? static_cast<uint64_t>(parsed) : 0;
+  }
+  return 0;
+}
+
+static uint8_t binary_state_code(const String& state_value,
+                                 bool available = true) {
+  String state = state_value;
+  state.trim();
+  state.toLowerCase();
+  if (!state.length()) return 2;
+  if (!available) return 3;
+  if (state == "on") return 1;
+  if (state == "off") return 0;
+  if (state == "unavailable") return 3;
+  return 2;
+}
+
+static uint32_t binary_state_color(uint8_t state) {
+  switch (state) {
+    case 1: return kBinaryActiveColor;
+    case 0: return kBinaryInactiveColor;
+    case 3: return kBinaryUnavailableColor;
+    default: return kBinaryUnknownColor;
+  }
+}
+
+static int binary_state_priority(uint8_t state) {
+  switch (state) {
+    case 1: return 4;
+    case 3: return 3;
+    case 2: return 2;
+    default: return 1;
+  }
+}
+
+static const char* binary_state_identifier(uint8_t state) {
+  switch (state) {
+    case 1: return "on";
+    case 0: return "off";
+    case 3: return "unavailable";
+    default: return "unknown";
+  }
+}
+
+static size_t bounded_utf8_prefix_length(const String& value,
+                                         size_t max_bytes) {
+  size_t offset = 0;
+  const size_t length = value.length();
+  while (offset < length && offset < max_bytes) {
+    const uint8_t lead = static_cast<uint8_t>(value.charAt(offset));
+    size_t sequence_length = 1;
+    if ((lead & 0xE0U) == 0xC0U) {
+      sequence_length = 2;
+    } else if ((lead & 0xF0U) == 0xE0U) {
+      sequence_length = 3;
+    } else if ((lead & 0xF8U) == 0xF0U) {
+      sequence_length = 4;
+    }
+    if (offset + sequence_length > length ||
+        offset + sequence_length > max_bytes) {
+      break;
+    }
+    offset += sequence_length;
+  }
+  return offset;
+}
+
+static String normalize_state_live_value(const String& value) {
+  String normalized = value;
+  normalized.trim();
+  constexpr size_t kMaxLiveStateBytes = 255;
+  if (normalized.length() > kMaxLiveStateBytes) {
+    normalized.remove(
+        bounded_utf8_prefix_length(normalized, kMaxLiveStateBytes));
+  }
+  return normalized;
+}
+
+static String normalize_state_history_value(const String& value) {
+  String normalized = normalize_state_live_value(value);
+  if (!normalized.length()) return "unknown";
+  if (normalized.equalsIgnoreCase("unknown")) return "unknown";
+  if (normalized.equalsIgnoreCase("unavailable")) return "unavailable";
+
+  constexpr size_t kMaxHistoryStateBytes = 32;
+  constexpr size_t kDigestHexChars = 8;
+  constexpr size_t kSuffixBytes = 1 + kDigestHexChars;
+  if (normalized.length() <= kMaxHistoryStateBytes) return normalized;
+
+  uint8_t digest[32] = {};
+  if (mbedtls_sha256(
+          reinterpret_cast<const uint8_t*>(normalized.c_str()),
+          normalized.length(), digest, 0) != 0) {
+    return "unknown";
+  }
+  const size_t prefix_length = bounded_utf8_prefix_length(
+      normalized, kMaxHistoryStateBytes - kSuffixBytes);
+  normalized.remove(prefix_length);
+  char suffix[kSuffixBytes + 1] = {};
+  snprintf(suffix, sizeof(suffix), "~%02x%02x%02x%02x", digest[0], digest[1],
+           digest[2], digest[3]);
+  normalized += suffix;
+  return normalized;
+}
+
+static String format_state_history_label(const String& value) {
+  String label = normalize_state_history_value(value);
+  if (!label.length()) return "--";
+  if (label.equalsIgnoreCase("unknown") ||
+      label.equalsIgnoreCase("unavailable")) {
+    return i18n::binary_sensor_state_label(
+        configManager.getConfig().language, label, "");
+  }
+  label.replace("_", " ");
+  const char first = label.charAt(0);
+  if (first >= 'a' && first <= 'z') {
+    label.setCharAt(0, static_cast<char>(first - ('a' - 'A')));
+  }
+  return label;
+}
+
+static uint32_t state_history_color(const SensorPopupContext* ctx,
+                                    const String& value) {
+  (void)ctx;
+  const String normalized = normalize_state_history_value(value);
+  if (normalized.equalsIgnoreCase("unavailable")) {
+    return kBinaryUnavailableColor;
+  }
+  if (!normalized.length() || normalized.equalsIgnoreCase("unknown")) {
+    return kBinaryUnknownColor;
+  }
+  uint32_t hash = 2166136261U;
+  for (size_t index = 0; index < normalized.length(); ++index) {
+    hash ^= static_cast<uint8_t>(normalized.charAt(index));
+    hash *= 16777619U;
+  }
+  return kStateHistoryColors[
+      hash % (sizeof(kStateHistoryColors) / sizeof(kStateHistoryColors[0]))];
+}
+
+static uint32_t local_date_key(uint64_t epoch_seconds, struct tm* out = nullptr) {
+  if (!epoch_seconds) return 0;
+  const time_t timestamp = static_cast<time_t>(epoch_seconds);
+  struct tm timeinfo;
+#ifdef _WIN32
+  localtime_s(&timeinfo, &timestamp);
+#else
+  localtime_r(&timestamp, &timeinfo);
+#endif
+  if (out) *out = timeinfo;
+  return static_cast<uint32_t>((timeinfo.tm_year + 1900) * 10000 +
+                               (timeinfo.tm_mon + 1) * 100 +
+                               timeinfo.tm_mday);
+}
+
+static String format_state_history_date(uint64_t epoch_seconds) {
+  struct tm timeinfo;
+  const uint32_t date_key = local_date_key(epoch_seconds, &timeinfo);
+  if (!date_key) return "--";
+
+  const DeviceConfig& cfg = configManager.getConfig();
+  const auto& locale = i18n::locale(cfg.language);
+  struct tm now_info;
+  const time_t now = time(nullptr);
+#ifdef _WIN32
+  localtime_s(&now_info, &now);
+#else
+  localtime_r(&now, &now_info);
+#endif
+  const uint32_t today_key =
+      static_cast<uint32_t>((now_info.tm_year + 1900) * 10000 +
+                            (now_info.tm_mon + 1) * 100 + now_info.tm_mday);
+  String result = date_key == today_key
+                      ? String(locale.weather_today)
+                      : String(clock_tile::weekday_name(timeinfo.tm_wday,
+                                                        cfg.language));
+  result += " · ";
+
+  char date_buffer[16];
+  const uint8_t date_format = clock_tile::resolve_date_format(
+      clock_tile::DATE_FORMAT_AUTO, cfg.global_date_format, cfg.language);
+  if (date_format == clock_tile::DATE_FORMAT_MDY) {
+    snprintf(date_buffer, sizeof(date_buffer), "%02d/%02d/%04d",
+             timeinfo.tm_mon + 1, timeinfo.tm_mday, timeinfo.tm_year + 1900);
+  } else if (date_format == clock_tile::DATE_FORMAT_YMD) {
+    snprintf(date_buffer, sizeof(date_buffer), "%04d-%02d-%02d",
+             timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday);
+  } else {
+    snprintf(date_buffer, sizeof(date_buffer), "%02d.%02d.%04d",
+             timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900);
+  }
+  result += date_buffer;
+  return result;
+}
+
+static String format_binary_activity_time(uint64_t epoch_seconds,
+                                          bool include_day) {
+  if (!epoch_seconds) return "--";
+  const time_t timestamp = static_cast<time_t>(epoch_seconds);
+  struct tm timeinfo;
+#ifdef _WIN32
+  localtime_s(&timeinfo, &timestamp);
+#else
+  localtime_r(&timestamp, &timeinfo);
+#endif
+
+  const DeviceConfig& cfg = configManager.getConfig();
+  const uint8_t time_format = clock_tile::resolve_time_format(
+      clock_tile::TIME_FORMAT_AUTO, cfg.global_time_format, cfg.language);
+  char time_buffer[20];
+  if (time_format == clock_tile::TIME_FORMAT_24H) {
+    snprintf(time_buffer, sizeof(time_buffer), "%02d:%02d:%02d",
+             timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+  } else {
+    int hour = timeinfo.tm_hour % 12;
+    if (hour == 0) hour = 12;
+    snprintf(time_buffer, sizeof(time_buffer), "%d:%02d:%02d %s", hour,
+             timeinfo.tm_min, timeinfo.tm_sec,
+             timeinfo.tm_hour < 12 ? "AM" : "PM");
+  }
+  if (!include_day) return String(time_buffer);
+  String result = get_weekday_abbrev(static_cast<uint8_t>(timeinfo.tm_wday));
+  result += " ";
+  result += time_buffer;
+  return result;
+}
+
+static void on_binary_timeline_draw(lv_event_t* event) {
+  const ui_theme::SurfaceScope popup_scope = popup_surface::scope();
+  if (lv_event_get_code(event) != LV_EVENT_DRAW_MAIN) return;
+  SensorPopupContext* ctx = static_cast<SensorPopupContext*>(
+      lv_event_get_user_data(event));
+  if (!ctx || !ctx->binary_timeline ||
+      (ctx->binary_timeline_bins.empty() && ctx->binary_segments.empty()) ||
+      ctx->binary_range_end <= ctx->binary_range_start) {
+    return;
+  }
+  lv_layer_t* layer = lv_event_get_layer(event);
+  if (!layer) return;
+  lv_area_t area;
+  lv_obj_get_coords(ctx->binary_timeline, &area);
+  const uint64_t span = ctx->binary_range_end - ctx->binary_range_start;
+  const lv_coord_t width = lv_area_get_width(&area);
+  if (!span || width < 3) return;
+
+  auto draw_section = [&](lv_coord_t x1, lv_coord_t x2, uint32_t color) {
+    if (x1 < area.x1) x1 = area.x1;
+    if (x2 > area.x2) x2 = area.x2;
+    if (x2 < x1) x2 = x1;
+
+    lv_draw_rect_dsc_t fill;
+    lv_draw_rect_dsc_init(&fill);
+    fill.base.layer = layer;
+    fill.bg_color = lv_color_hex(color);
+    fill.bg_opa = LV_OPA_COVER;
+    fill.border_opa = LV_OPA_TRANSP;
+    fill.radius = 0;
+    lv_area_t section_area = {x1, area.y1, x2, area.y2};
+    lv_draw_rect(layer, &fill, &section_area);
+  };
+
+  if (!ctx->binary_timeline_bins.empty()) {
+    const size_t count = ctx->binary_timeline_bins.size();
+    auto state_for_pixel = [&](lv_coord_t pixel) {
+      size_t first =
+          (static_cast<size_t>(pixel) * count) /
+          static_cast<size_t>(width);
+      size_t last =
+          ((static_cast<size_t>(pixel + 1) * count) +
+           static_cast<size_t>(width) - 1U) /
+          static_cast<size_t>(width);
+      if (last <= first) last = first + 1U;
+      if (last > count) last = count;
+      uint8_t selected = ctx->binary_timeline_bins[first];
+      if (!ctx->binary_mode) {
+        return ctx->binary_timeline_bins[last - 1U];
+      }
+      int selected_priority = binary_state_priority(selected);
+      for (size_t index = first + 1U; index < last; ++index) {
+        const uint8_t candidate = ctx->binary_timeline_bins[index];
+        const int candidate_priority = binary_state_priority(candidate);
+        if (candidate_priority > selected_priority) {
+          selected = candidate;
+          selected_priority = candidate_priority;
+        }
+      }
+      return selected;
+    };
+
+    lv_coord_t run_start = 0;
+    uint8_t run_state = state_for_pixel(0);
+    for (lv_coord_t pixel = 1; pixel <= width; ++pixel) {
+      const uint8_t next_state =
+          pixel < width ? state_for_pixel(pixel) : run_state;
+      if (pixel < width && next_state == run_state) continue;
+      const uint32_t color =
+          ctx->binary_mode
+              ? binary_state_color(run_state)
+              : (run_state < ctx->state_history_palette.size()
+                     ? state_history_color(
+                           ctx, ctx->state_history_palette[run_state])
+                     : kBinaryUnknownColor);
+      draw_section(static_cast<lv_coord_t>(area.x1 + run_start),
+                   static_cast<lv_coord_t>(area.x1 + pixel - 1), color);
+      run_start = pixel;
+      run_state = next_state;
+    }
+    return;
+  }
+
+  for (const SensorPopupContext::BinarySegment& segment :
+       ctx->binary_segments) {
+    const uint64_t start = std::max(segment.start, ctx->binary_range_start);
+    const uint64_t end = std::min(segment.end, ctx->binary_range_end);
+    if (end <= start) continue;
+    lv_coord_t x1 = static_cast<lv_coord_t>(
+        area.x1 + ((start - ctx->binary_range_start) * width) / span);
+    lv_coord_t x2 = static_cast<lv_coord_t>(
+        area.x1 + ((end - ctx->binary_range_start) * width) / span - 1);
+    draw_section(x1, x2,
+                 ctx->binary_mode ? binary_state_color(segment.state)
+                                  : state_history_color(ctx, segment.value));
+  }
+}
+
+static void update_binary_time_axis(SensorPopupContext* ctx) {
+  if (!ctx) return;
+  // Reused popups also call this when clearing/loading history. A Number
+  // uses the chart's axis; temporal editors have no timeline at all.
+  if (ctx->editable && ctx->editable_kind != "select") {
+    for (auto* label : ctx->binary_time_labels) {
+      if (label) lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+    }
+    return;
+  }
+  String labels[kTimeAxisMarkerCount];
+  float fractions[kTimeAxisMarkerCount] = {};
+  const int count = calc_time_axis(ctx, labels, fractions,
+                                   kTimeAxisMarkerCount);
+  lv_obj_update_layout(ctx->binary_body);
+  const int width = lv_obj_get_width(ctx->binary_timeline);
+  for (int index = 0; index < kTimeAxisMarkerCount; ++index) {
+    lv_obj_t* label = ctx->binary_time_labels[index];
+    if (!label) continue;
+    if (index >= count || width <= 0) {
+      lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+      continue;
+    }
+    lv_label_set_text(label, labels[index].c_str());
+    lv_obj_set_width(label, LV_SIZE_CONTENT);
+    const int label_width = measure_label_text_width(label);
+    int x = static_cast<int>(fractions[index] * width) - (label_width / 2);
+    if (x < 0) x = 0;
+    if (x + label_width > width) x = width - label_width;
+    if (x < 0) x = 0;
+    lv_obj_set_x(label, x);
+    lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+static void refresh_binary_labels(SensorPopupContext* ctx) {
+  if (!ctx) return;
+  const char* language = configManager.getConfig().language;
+  if (ctx->binary_history_title) {
+    lv_label_set_text(ctx->binary_history_title,
+                      i18n::binary_sensor_label(language, 2));
+  }
+  if (ctx->binary_activity_title) {
+    lv_label_set_text(ctx->binary_activity_title,
+                      i18n::binary_sensor_label(language, 3));
+  }
+}
+
+static void refresh_binary_activity_rows(SensorPopupContext* ctx,
+                                         bool force) {
+  if (!ctx || !ctx->binary_activity_viewport) return;
+
+  const size_t activity_count = ctx->binary_activity.size();
+  int32_t scroll_y = lv_obj_get_scroll_y(ctx->binary_activity_viewport);
+  if (scroll_y < 0) scroll_y = 0;
+  size_t first_row = static_cast<size_t>(scroll_y / kBinaryActivityRowHeight);
+  if (activity_count && first_row >= activity_count) {
+    first_row = activity_count - 1;
+  }
+  if (!force && first_row == ctx->binary_activity_first_row) return;
+  ctx->binary_activity_first_row = first_row;
+
+  if (ctx->binary_activity_date) {
+    const uint32_t date_key =
+        activity_count
+            ? local_date_key(ctx->binary_activity[first_row].timestamp)
+            : 0;
+    if (!date_key) {
+      ctx->binary_activity_date_key = 0;
+      lv_obj_add_flag(ctx->binary_activity_date, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      if (force || date_key != ctx->binary_activity_date_key) {
+        const String date = format_state_history_date(
+            ctx->binary_activity[first_row].timestamp);
+        lv_label_set_text(ctx->binary_activity_date, date.c_str());
+        ctx->binary_activity_date_key = date_key;
+      }
+      lv_obj_clear_flag(ctx->binary_activity_date, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+
+  const int dot_center_y = kBinaryActivityRowHeight / 2;
+  bool active_pool[kBinaryActivityPoolRows] = {};
+  const size_t last_row = std::min(
+      activity_count, first_row + static_cast<size_t>(kBinaryActivityPoolRows));
+  for (size_t activity_index = first_row; activity_index < last_row;
+       ++activity_index) {
+    const int pool_index = static_cast<int>(
+        activity_index % static_cast<size_t>(kBinaryActivityPoolRows));
+    active_pool[pool_index] = true;
+    lv_obj_t* row = ctx->binary_activity_rows[pool_index];
+    if (!row) continue;
+    const SensorPopupContext::BinaryActivityEntry& entry =
+        ctx->binary_activity[activity_index];
+    if (force ||
+        ctx->binary_activity_row_indices[pool_index] != activity_index) {
+      ctx->binary_activity_row_indices[pool_index] = activity_index;
+      lv_obj_set_y(row, static_cast<int32_t>(activity_index) *
+                            kBinaryActivityRowHeight);
+      const uint32_t color =
+          ctx->binary_mode ? binary_state_color(entry.state)
+                           : state_history_color(ctx, entry.value);
+      lv_obj_set_style_bg_color(ctx->binary_activity_dots[pool_index],
+                                lv_color_hex(color), 0);
+      const String state_label =
+          ctx->binary_mode
+              ? String(i18n::binary_sensor_state_label(
+                    configManager.getConfig().language,
+                    binary_state_identifier(entry.state),
+                    ctx->binary_device_class))
+              : format_state_history_label(entry.value);
+      lv_label_set_text(ctx->binary_activity_states[pool_index],
+                        state_label.c_str());
+      const String time_label = format_binary_activity_time(
+          entry.timestamp, ctx->history_range == SensorHistoryRange::Day7);
+      lv_label_set_text(ctx->binary_activity_times[pool_index],
+                        time_label.c_str());
+
+      lv_obj_t* line = ctx->binary_activity_lines[pool_index];
+      if (line) {
+        if (activity_count < 2) {
+          lv_obj_add_flag(line, LV_OBJ_FLAG_HIDDEN);
+        } else {
+          const int line_top = activity_index == 0 ? dot_center_y : 0;
+          const int line_bottom = activity_index + 1 == activity_count
+                                      ? dot_center_y + 1
+                                      : kBinaryActivityRowHeight;
+          lv_obj_set_y(line, line_top);
+          lv_obj_set_height(line, std::max(1, line_bottom - line_top));
+          lv_obj_clear_flag(line, LV_OBJ_FLAG_HIDDEN);
+        }
+      }
+      lv_obj_t* divider = ctx->binary_activity_dividers[pool_index];
+      if (divider) {
+        if (activity_index + 1 < activity_count) {
+          lv_obj_clear_flag(divider, LV_OBJ_FLAG_HIDDEN);
+        } else {
+          lv_obj_add_flag(divider, LV_OBJ_FLAG_HIDDEN);
+        }
+      }
+    }
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  for (int pool_index = 0; pool_index < kBinaryActivityPoolRows;
+       ++pool_index) {
+    if (active_pool[pool_index]) continue;
+    ctx->binary_activity_row_indices[pool_index] =
+        kBinaryMaxActivityEntries;
+    if (ctx->binary_activity_rows[pool_index]) {
+      lv_obj_add_flag(ctx->binary_activity_rows[pool_index],
+                      LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+}
+
+static void on_binary_activity_scroll(lv_event_t* event) {
+  const ui_theme::SurfaceScope popup_scope = popup_surface::scope();
+  if (lv_event_get_code(event) != LV_EVENT_SCROLL) return;
+  SensorPopupContext* ctx = static_cast<SensorPopupContext*>(
+      lv_event_get_user_data(event));
+  refresh_binary_activity_rows(ctx);
+}
+
+static uint8_t state_history_palette_index(SensorPopupContext* ctx,
+                                           const String& value,
+                                           bool add_if_missing) {
+  if (!ctx) return 0;
+  const String normalized = normalize_state_history_value(value);
+  for (size_t index = 0; index < ctx->state_history_palette.size(); ++index) {
+    if (ctx->state_history_palette[index] == normalized) {
+      return static_cast<uint8_t>(index);
+    }
+  }
+  if (add_if_missing &&
+      ctx->state_history_palette.size() < kStateHistoryMaxPaletteEntries) {
+    ctx->state_history_palette.push_back(normalized);
+    return static_cast<uint8_t>(ctx->state_history_palette.size() - 1U);
+  }
+  for (size_t index = 0; index < ctx->state_history_palette.size(); ++index) {
+    if (ctx->state_history_palette[index].equalsIgnoreCase("unknown")) {
+      return static_cast<uint8_t>(index);
+    }
+  }
+  return 0;
+}
+
+static void prepend_state_history_activity(SensorPopupContext* ctx,
+                                           uint64_t timestamp,
+                                           uint8_t state,
+                                           const String& value) {
+  if (!ctx || !timestamp) return;
+  const String normalized = ctx->binary_mode
+                                ? String(binary_state_identifier(state))
+                                : normalize_state_history_value(value);
+  if (!ctx->binary_activity.empty() &&
+      ctx->binary_activity.front().timestamp == timestamp &&
+      ctx->binary_activity.front().state == state &&
+      ctx->binary_activity.front().value == normalized) {
+    return;
+  }
+
+  int32_t previous_scroll_y = 0;
+  if (ctx->binary_activity_viewport) {
+    previous_scroll_y = lv_obj_get_scroll_y(ctx->binary_activity_viewport);
+    if (previous_scroll_y < 0) previous_scroll_y = 0;
+  }
+  SensorPopupContext::BinaryActivityEntry entry;
+  entry.timestamp = timestamp;
+  entry.state = state;
+  entry.value = normalized;
+  ctx->binary_activity.insert(ctx->binary_activity.begin(), entry);
+  if (ctx->binary_activity.size() > kBinaryMaxActivityEntries) {
+    ctx->binary_activity.resize(kBinaryMaxActivityEntries);
+  }
+
+  if (!ctx->binary_timeline_bins.empty()) {
+    const uint8_t timeline_state =
+        ctx->binary_mode
+            ? state
+            : state_history_palette_index(ctx, normalized, true);
+    size_t first_bin = ctx->binary_timeline_bins.size() - 1U;
+    if (ctx->binary_range_end > ctx->binary_range_start &&
+        timestamp <= ctx->binary_range_start) {
+      first_bin = 0;
+    } else if (ctx->binary_range_end > ctx->binary_range_start &&
+               timestamp < ctx->binary_range_end) {
+      first_bin = static_cast<size_t>(
+          ((timestamp - ctx->binary_range_start) *
+           ctx->binary_timeline_bins.size()) /
+          (ctx->binary_range_end - ctx->binary_range_start));
+      if (first_bin >= ctx->binary_timeline_bins.size()) {
+        first_bin = ctx->binary_timeline_bins.size() - 1U;
+      }
+    }
+    if (!ctx->binary_mode ||
+        binary_state_priority(timeline_state) > binary_state_priority(
+            ctx->binary_timeline_bins[first_bin])) {
+      ctx->binary_timeline_bins[first_bin] = timeline_state;
+    }
+    if (first_bin + 1U < ctx->binary_timeline_bins.size()) {
+      std::fill(ctx->binary_timeline_bins.begin() + first_bin + 1U,
+                ctx->binary_timeline_bins.end(), timeline_state);
+    }
+    if (ctx->binary_timeline) lv_obj_invalidate(ctx->binary_timeline);
+    // A finger resting on the timeline reads the new state with the next frame;
+    // a kept readout reads it now.
+    ctx->readout_point = -1;
+    ctx->readout_from = ctx->readout_to = 0;
+    ctx->readout.request_apply();
+    refresh_sensor_readout(ctx);
+  }
+
+  if (ctx->binary_activity_status) {
+    lv_obj_add_flag(ctx->binary_activity_status, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  ctx->binary_activity_first_row = kBinaryMaxActivityEntries;
+  ctx->binary_activity_date_key = 0;
+  for (int index = 0; index < kBinaryActivityPoolRows; ++index) {
+    ctx->binary_activity_row_indices[index] = kBinaryMaxActivityEntries;
+  }
+  if (ctx->binary_activity_viewport) {
+    const int viewport_height = std::max(
+        kBinaryActivityRowHeight,
+        static_cast<int>(lv_obj_get_height(ctx->binary_activity_viewport)));
+    const int content_height = std::max(
+        viewport_height,
+        static_cast<int>(ctx->binary_activity.size()) *
+            kBinaryActivityRowHeight);
+    if (ctx->binary_activity_spacer) {
+      lv_obj_set_height(ctx->binary_activity_spacer, content_height);
+    }
+    lv_obj_update_layout(ctx->binary_activity_viewport);
+    const int32_t target_scroll_y =
+        previous_scroll_y < (kBinaryActivityRowHeight / 2)
+            ? 0
+            : previous_scroll_y + kBinaryActivityRowHeight;
+    lv_obj_scroll_to_y(ctx->binary_activity_viewport, target_scroll_y,
+                       LV_ANIM_OFF);
+  }
+  refresh_binary_activity_rows(ctx, true);
+}
+
+static void clear_binary_history(SensorPopupContext* ctx) {
+  if (!ctx) return;
+  if (ctx->readout_kind == kReadoutTimeline) clear_sensor_readout(ctx);
+  ctx->binary_segments.clear();
+  ctx->binary_timeline_bins.clear();
+  ctx->state_history_palette.clear();
+  ctx->state_history_palette_complete = true;
+  ctx->binary_activity.clear();
+  ctx->binary_activity_first_row = kBinaryMaxActivityEntries;
+  ctx->binary_activity_date_key = 0;
+  ctx->binary_range_start = 0;
+  ctx->binary_range_end = 0;
+  if (ctx->binary_timeline) lv_obj_invalidate(ctx->binary_timeline);
+  for (int index = 0; index < kTimeAxisMarkerCount; ++index) {
+    if (ctx->binary_time_labels[index]) {
+      lv_obj_add_flag(ctx->binary_time_labels[index], LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+  for (int index = 0; index < kBinaryActivityPoolRows; ++index) {
+    ctx->binary_activity_row_indices[index] = kBinaryMaxActivityEntries;
+    if (ctx->binary_activity_rows[index]) {
+      lv_obj_add_flag(ctx->binary_activity_rows[index], LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+  if (ctx->binary_activity_date) {
+    lv_obj_add_flag(ctx->binary_activity_date, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (ctx->binary_activity_viewport) {
+    lv_obj_scroll_to_y(ctx->binary_activity_viewport, 0, LV_ANIM_OFF);
+    if (ctx->binary_activity_spacer) {
+      const int viewport_height = std::max(
+          kBinaryActivityRowHeight,
+          static_cast<int>(lv_obj_get_height(ctx->binary_activity_viewport)));
+      lv_obj_set_height(ctx->binary_activity_spacer, viewport_height);
+    }
+    refresh_binary_activity_rows(ctx, true);
+  }
+  if (ctx->binary_activity_status) {
+    lv_obj_add_flag(ctx->binary_activity_status, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (ctx->binary_history_status) {
+    lv_label_set_text(
+        ctx->binary_history_status,
+        i18n::strings(configManager.getConfig().language).loading);
+    lv_obj_clear_flag(ctx->binary_history_status, LV_OBJ_FLAG_HIDDEN);
+  }
+  set_range_buttons_visible(ctx, true);
+  update_binary_time_axis(ctx);
+}
+
+static void update_binary_icon(SensorPopupContext* ctx,
+                               const String& icon_name_value) {
+  if (!ctx || !ctx->icon_label || ctx->binary_icon_override) return;
+  String icon_name = normalizeMdiIconName(icon_name_value);
+  if (!icon_name.length()) return;
+  const String icon = getMdiChar(icon_name);
+  if (!icon.length()) return;
+  // A rule's own icon stays while its rule applies.
+  tile_rule_icon::set_glyph(ctx->icon_label, icon.c_str());
+  lv_obj_clear_flag(ctx->icon_label, LV_OBJ_FLAG_HIDDEN);
+  popup_layout::alignHeader(ctx->card, ctx->title_label, ctx->icon_label);
+}
+
+static void refresh_editable_popup_icon(SensorPopupContext* ctx) {
+  if (!ctx || !ctx->editable || !ctx->icon_label || ctx->binary_icon_override) return;
+  const String name = normalizeMdiIconName(haBridgeConfig.findEntityIcon(ctx->entity_id));
+  const String glyph = name.length() ? getMdiChar(name) : String();
+  tile_rule_icon::set_glyph(ctx->icon_label, glyph.c_str());
+  if (glyph.length()) lv_obj_remove_flag(ctx->icon_label, LV_OBJ_FLAG_HIDDEN);
+  else lv_obj_add_flag(ctx->icon_label, LV_OBJ_FLAG_HIDDEN);
+  popup_layout::alignHeader(ctx->card, ctx->title_label, ctx->icon_label);
+}
+
+static void update_binary_state(SensorPopupContext* ctx,
+                                const String& state_value,
+                                bool available,
+                                const String& device_class,
+                                uint64_t last_changed,
+                                const String& icon_name) {
+  if (!ctx) return;
+  String state = state_value;
+  state.trim();
+  state.toLowerCase();
+  const bool missing = !state.length();
+  if (missing) {
+    available = false;
+  } else if (!available || state == "unavailable") {
+    state = "unavailable";
+    available = false;
+  } else if (state != "on" && state != "off" && state != "unknown") {
+    state = "unknown";
+  }
+  ctx->binary_state = state;
+  ctx->binary_available = available;
+  ctx->binary_device_class = device_class;
+  ctx->binary_last_changed = last_changed;
+  if (ctx->value_label) {
+    show_header_value(ctx,
+                      missing ? String("--")
+                              : String(i18n::binary_sensor_state_label(configManager.getConfig().language,
+                                                                       state, device_class)),
+                      String());
+  }
+  if (ctx->icon_label) {
+    // Per-tile On/Off or state colors match the raw state or its label, like
+    // the tile; otherwise the Binary sensor state color stays.
+    const bool known = available && (state == "on" || state == "off");
+    apply_popup_icon_color(
+        ctx, known, state.c_str(),
+        known ? i18n::binary_sensor_state_label(configManager.getConfig().language, state,
+                                                device_class)
+              : nullptr,
+        lv_color_hex(binary_state_color(binary_state_code(state, available))));
+  }
+  update_binary_icon(ctx, icon_name);
+}
+
+// The header's value line for the first frame of an opening, before the
+// deferred content applies the same text through its regular update path.
+static void apply_sensor_header_value(SensorPopupContext* ctx,
+                                      const SensorPopupInit& init) {
+  if (!ctx || !ctx->value_label) return;
+  if (init.editable) {
+    const EditableValue value =
+        parse_editable_value(haBridgeConfig.findEditableValue(init.entity_id));
+    show_header_value(ctx, editable_display_number(value), editable_display_unit(value));
+    apply_editable_icon_color(ctx, value);
+    return;
+  }
+  if (init.binary_mode) {
+    ctx->binary_icon_override = init.binary_icon_override;
+    update_binary_state(ctx, init.value, init.binary_available,
+                        init.binary_device_class, init.binary_last_changed,
+                        init.icon_name);
+    return;
+  }
+  show_header_value(ctx, sensor_value_display(init.value, init.decimals, init.state_history_mode), init.unit);
+  apply_popup_icon_color(ctx, popup_icon_state_known(init.value), init.value.c_str(), nullptr,
+                         lv_color_hex(ui_theme::text()));
+}
+
+// ---------------------------------------------------------------------------
+// Graph readout. The old value row shows the time and value under the cursor
+// on the numeric chart or the state timeline. Sensors open on the newest
+// point (a dot in the line's color, no cursor line until a finger reads the
+// graph, issue #139) and keep the cursor where the finger leaves it; editors show it only
+// while touching. Only the cursor and two static labels change; chart,
+// timeline and Activity stay.
+
+static bool readout_twelve_hour() {
+  const DeviceConfig& cfg = configManager.getConfig();
+  return clock_tile::resolve_time_format(clock_tile::TIME_FORMAT_AUTO,
+                                         cfg.global_time_format, cfg.language) !=
+         clock_tile::TIME_FORMAT_24H;
+}
+
+static char readout_decimal_separator() {
+  return i18n::locale(configManager.getConfig().language).decimal_separator[0];
+}
+
+// Local time as in the Activity list, with the weekday for seven-day ranges
+// and the date for 30D.
+static size_t append_readout_time(char* out, size_t size, size_t used,
+                                  uint64_t epoch, bool with_day, bool with_date = false) {
+  if (epoch < kReadoutMinEpoch) return used;
+  const time_t timestamp = static_cast<time_t>(epoch);
+  struct tm timeinfo;
+#ifdef _WIN32
+  localtime_s(&timeinfo, &timestamp);
+#else
+  localtime_r(&timestamp, &timeinfo);
+#endif
+  // Formatted again only for another day or language: the cursor moves
+  // within a day.
+  static String date;
+  static int date_key = -1;
+  static char date_language[8] = "";
+  if (with_date) {
+    const char* language = configManager.getConfig().language;
+    const int key = timeinfo.tm_year * 400 + timeinfo.tm_yday;
+    if (key != date_key || strncmp(language, date_language, sizeof(date_language)) != 0) {
+      date = short_date_label(timeinfo);
+      date_key = key;
+      strncpy(date_language, language, sizeof(date_language) - 1);
+    }
+  }
+  return popup_graph_readout::append_clock(
+      out, size, used, timeinfo, readout_twelve_hour(),
+      with_date  ? date.c_str()
+      : with_day ? get_weekday_abbrev(static_cast<uint8_t>(timeinfo.tm_wday))
+                 : nullptr);
+}
+
+// Constant state identifiers, so reading another segment allocates nothing.
+static const String& binary_state_identifier_text(uint8_t state) {
+  static const String identifiers[] = {
+      binary_state_identifier(0), binary_state_identifier(1),
+      binary_state_identifier(2), binary_state_identifier(3)};
+  return identifiers[state < 4 ? state : 2];
+}
+
+// Activity label (format_state_history_label) of a canonical textual state
+// from the history palette or segments, written into a readout buffer.
+static void write_state_history_label(char* out, size_t size,
+                                      const String& value) {
+  if (!out || !size) return;
+  out[0] = '\0';
+  if (!value.length()) {
+    popup_graph_readout::append(out, size, 0, "--");
+    return;
+  }
+  if (value.equalsIgnoreCase(binary_state_identifier_text(2)) ||
+      value.equalsIgnoreCase(binary_state_identifier_text(3))) {
+    popup_graph_readout::append(
+        out, size, 0,
+        i18n::binary_sensor_state_label(configManager.getConfig().language, value,
+                                        String()));
+    return;
+  }
+  popup_graph_readout::append(out, size, 0, value.c_str());
+  for (char* p = out; *p; ++p) {
+    if (*p == '_') *p = ' ';
+  }
+  if (out[0] >= 'a' && out[0] <= 'z') out[0] = static_cast<char>(out[0] - ('a' - 'A'));
+}
+
+static lv_obj_t* readout_target(const SensorPopupContext* ctx) {
+  if (ctx->readout_kind == kReadoutChart) return ctx->chart_wrap;
+  if (ctx->readout_kind == kReadoutTimeline) return ctx->binary_timeline;
+  return nullptr;
+}
+
+static void invalidate_readout_cursor(SensorPopupContext* ctx) {
+  lv_obj_t* target = readout_target(ctx);
+  if (!target) return;
+  lv_area_t coords;
+  lv_obj_get_coords(target, &coords);
+  const int32_t reach = kReadoutDotSize / 2 + kReadoutLineWidth + 1;
+  lv_area_t area = {coords.x1 + ctx->readout_x - reach, coords.y1 + ctx->readout_top - reach,
+                    coords.x1 + ctx->readout_x + reach, coords.y1 + ctx->readout_bottom + reach};
+  lv_obj_invalidate_area(target, &area);
+}
+
+// Drawn after the graph's children, so the cursor needs no objects that move
+// or change layout while dragging.
+static void on_readout_cursor_draw(lv_event_t* event) {
+  const ui_theme::SurfaceScope popup_scope = popup_surface::scope();
+  auto* ctx = static_cast<SensorPopupContext*>(lv_event_get_user_data(event));
+  auto* target = static_cast<lv_obj_t*>(lv_event_get_current_target(event));
+  if (!ctx || !target || readout_target(ctx) != target) return;
+  lv_layer_t* layer = lv_event_get_layer(event);
+  if (!layer) return;
+  lv_area_t coords;
+  lv_obj_get_coords(target, &coords);
+  const int32_t x = coords.x1 + ctx->readout_x;
+  if (!ctx->readout_touched) {
+    // Untouched: no line; the chart's newest point as a dot in its color.
+    if (ctx->readout_kind != kReadoutChart) return;
+    lv_draw_rect_dsc_t dot;
+    lv_draw_rect_dsc_init(&dot);
+    dot.base.layer = layer;
+    dot.bg_color = ctx->icon_label ? lv_obj_get_style_text_color(ctx->icon_label, LV_PART_MAIN)
+                                   : lv_color_hex(ui_theme::text());
+    dot.bg_opa = LV_OPA_COVER;
+    dot.radius = LV_RADIUS_CIRCLE;
+    dot.border_color = lv_obj_get_style_bg_color(ctx->card, LV_PART_MAIN);
+    dot.border_width = kReadoutDotRing;
+    dot.border_opa = LV_OPA_COVER;
+    const int32_t dot_x = x - kReadoutDotSize / 2;
+    const int32_t dot_y = coords.y1 + ctx->readout_y - kReadoutDotSize / 2;
+    lv_area_t dot_area = {dot_x, dot_y, dot_x + kReadoutDotSize - 1, dot_y + kReadoutDotSize - 1};
+    lv_draw_rect(layer, &dot, &dot_area);
+    return;
+  }
+
+  lv_draw_rect_dsc_t line;
+  lv_draw_rect_dsc_init(&line);
+  line.base.layer = layer;
+  line.bg_color = lv_color_hex(ui_theme::text());
+  line.bg_opa = LV_OPA_COVER;
+  line.radius = 0;
+  const int32_t line_x = x - kReadoutLineWidth / 2;
+  lv_area_t line_area = {line_x, coords.y1 + ctx->readout_top,
+                         line_x + kReadoutLineWidth - 1, coords.y1 + ctx->readout_bottom};
+  lv_draw_rect(layer, &line, &line_area);
+  if (ctx->readout_kind != kReadoutChart) return;
+
+  lv_draw_rect_dsc_t dot;
+  lv_draw_rect_dsc_init(&dot);
+  dot.base.layer = layer;
+  dot.bg_color = lv_color_hex(ui_theme::text());
+  dot.bg_opa = LV_OPA_COVER;
+  dot.radius = LV_RADIUS_CIRCLE;
+  dot.border_color = lv_obj_get_style_bg_color(ctx->card, LV_PART_MAIN);
+  dot.border_width = kReadoutDotRing;
+  dot.border_opa = LV_OPA_COVER;
+  const int32_t dot_x = x - kReadoutDotSize / 2;
+  const int32_t dot_y = coords.y1 + ctx->readout_y - kReadoutDotSize / 2;
+  lv_area_t dot_area = {dot_x, dot_y, dot_x + kReadoutDotSize - 1,
+                        dot_y + kReadoutDotSize - 1};
+  lv_draw_rect(layer, &dot, &dot_area);
+}
+
+static void show_readout_band(SensorPopupContext* ctx) {
+  if (!ctx->value_box) return;
+  if (ctx->editable && !ctx->readout_band_raised) {
+    // Editors occupy the value row. Cover their band only while a finger is
+    // on the graph; release restores them unchanged.
+    if (ctx->control_row) {
+      const int32_t top = lv_obj_get_y(ctx->control_row);
+      int32_t height = lv_obj_get_height(ctx->control_row);
+      if (ctx->body_box && lv_obj_get_y(ctx->body_box) > top)
+        height = lv_obj_get_y(ctx->body_box) - top;
+      lv_obj_set_y(ctx->value_box, top);
+      lv_obj_set_height(ctx->value_box, height);
+    }
+    lv_obj_set_style_bg_color(ctx->value_box,
+                              lv_obj_get_style_bg_color(ctx->card, LV_PART_MAIN), 0);
+    lv_obj_set_style_bg_opa(ctx->value_box, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(ctx->value_box, LV_OBJ_FLAG_HIDDEN);
+    ctx->readout_band_raised = true;
+  }
+  lv_label_set_text_static(ctx->readout_time_label, ctx->readout_time_text);
+  lv_label_set_text_static(ctx->readout_value_label, ctx->readout_value_text);
+  value_unit::place(ctx->readout_value_label, ctx->readout_unit_label);
+  popup_graph_readout::show_band_labels(ctx->readout_time_label,
+                                        ctx->readout_value_label, true);
+}
+
+// Hiding, opening, a range change, teardown and an editor's release restore
+// the normal drawing.
+static void clear_sensor_readout(SensorPopupContext* ctx) {
+  if (!ctx) return;
+  invalidate_readout_cursor(ctx);
+  ctx->readout_kind = kReadoutNone;
+  ctx->readout_point = -1;
+  ctx->readout_from = ctx->readout_to = 0;
+  popup_graph_readout::show_band_labels(ctx->readout_time_label,
+                                        ctx->readout_value_label, false);
+  if (!ctx->readout_band_raised || !ctx->value_box) return;
+  ctx->readout_band_raised = false;
+  lv_obj_set_style_bg_opa(ctx->value_box, LV_OPA_TRANSP, 0);
+  lv_obj_set_y(ctx->value_box, popup_layout::kValueY - kContentLiftY);
+  lv_obj_set_height(ctx->value_box, popup_layout::kValueHeight);
+  if (ctx->editable) lv_obj_add_flag(ctx->value_box, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void move_readout_cursor(SensorPopupContext* ctx, uint8_t kind, int32_t x,
+                                int32_t y, int32_t top, int32_t bottom) {
+  invalidate_readout_cursor(ctx);
+  ctx->readout_kind = kind;
+  ctx->readout_x = x;
+  ctx->readout_y = y;
+  ctx->readout_top = top;
+  ctx->readout_bottom = bottom;
+  invalidate_readout_cursor(ctx);
+}
+
+// Numeric chart: snap to the nearest real history point. Missing buckets are
+// never interpolated, averaged or reduced to a minimum or maximum.
+static void apply_chart_readout(SensorPopupContext* ctx, const lv_point_t& point) {
+  lv_obj_t* chart = ctx->chart;
+  const uint32_t count = chart && ctx->series ? lv_chart_get_point_count(chart) : 0;
+  int32_t* values = count ? lv_chart_get_series_y_array(chart, ctx->series) : nullptr;
+  if (!values || lv_obj_has_flag(ctx->chart_wrap, LV_OBJ_FLAG_HIDDEN)) {
+    clear_sensor_readout(ctx);
+    return;
+  }
+  lv_area_t content;
+  lv_obj_get_content_coords(chart, &content);
+  const int32_t width = lv_area_get_width(&content);
+  if (width <= 0) {
+    clear_sensor_readout(ctx);
+    return;
+  }
+  int32_t x = point.x - content.x1;
+  if (x < 0) x = 0;
+  if (x > width) x = width;
+  uint32_t index = count > 1 ? static_cast<uint32_t>(
+                                   (x * static_cast<int32_t>(count - 1) + width / 2) / width)
+                             : 0;
+  if (index >= count) index = count - 1;
+  int32_t found = -1;
+  for (uint32_t distance = 0; distance < count && found < 0; ++distance) {
+    if (index >= distance && values[index - distance] != LV_CHART_POINT_NONE) {
+      found = static_cast<int32_t>(index - distance);
+    } else if (index + distance < count && values[index + distance] != LV_CHART_POINT_NONE) {
+      found = static_cast<int32_t>(index + distance);
+    }
+  }
+  if (found < 0) {
+    clear_sensor_readout(ctx);
+    return;
+  }
+  if (ctx->readout_kind == kReadoutChart && ctx->readout_point == found) return;
+
+  lv_point_t position;
+  lv_chart_get_point_pos_by_id(chart, ctx->series, static_cast<uint32_t>(found), &position);
+  lv_area_t chart_area, wrap_area;
+  lv_obj_get_coords(chart, &chart_area);
+  lv_obj_get_coords(ctx->chart_wrap, &wrap_area);
+  move_readout_cursor(ctx, kReadoutChart, chart_area.x1 + position.x - wrap_area.x1,
+                      chart_area.y1 + position.y - wrap_area.y1,
+                      content.y1 - wrap_area.y1, content.y2 - wrap_area.y1);
+  ctx->readout_point = found;
+
+  // Point times follow the same linear axis as the drawn chart.
+  ctx->readout_time_text[0] = '\0';
+  if (ctx->chart_range_end > ctx->chart_range_start) {
+    const uint64_t span = ctx->chart_range_end - ctx->chart_range_start;
+    const uint64_t time = count > 1
+        ? ctx->chart_range_start + span * static_cast<uint64_t>(found) / (count - 1)
+        : ctx->chart_range_end;
+    append_readout_time(ctx->readout_time_text, sizeof(ctx->readout_time_text), 0, time,
+                        ctx->history_range == SensorHistoryRange::Day7,
+                        ctx->history_range == SensorHistoryRange::Day30);
+  }
+  const float value =
+      ctx->history_values && static_cast<size_t>(found) < ctx->history_values_count &&
+              isfinite(ctx->history_values[found])
+          ? ctx->history_values[found]
+          : static_cast<float>(values[found]) / static_cast<float>(ctx->chart_scale);
+  // Editors show the raw state; Sensors may use configured decimals.
+  const uint8_t digits = popup_digits(ctx, value);
+  // The number in the static buffer (no allocation while dragging), its
+  // unit a step smaller after it (value_unit.h, user 2026-10-26).
+  popup_graph_readout::format_number(ctx->readout_value_text,
+                                     sizeof(ctx->readout_value_text), value, digits,
+                                     readout_decimal_separator(), nullptr);
+  value_unit::reserve(ctx->readout_value_label, ctx->readout_unit_label, isfinite(value) ? ctx->unit.c_str() : "");
+  show_readout_band(ctx);
+}
+
+// State timeline: the state of the touched segment and its time range. The
+// pixel uses the same bins as the drawn bar, so a visible spike reads back.
+static void apply_timeline_readout(SensorPopupContext* ctx, const lv_point_t& point) {
+  lv_obj_t* timeline = ctx->binary_timeline;
+  lv_area_t area;
+  lv_obj_get_coords(timeline, &area);
+  const int32_t width = lv_area_get_width(&area);
+  const uint64_t range_start = ctx->binary_range_start;
+  const uint64_t range_end = ctx->binary_range_end;
+  if (width < 1 || range_end <= range_start ||
+      lv_obj_has_flag(timeline, LV_OBJ_FLAG_HIDDEN) ||
+      (ctx->binary_timeline_bins.empty() && ctx->binary_segments.empty())) {
+    clear_sensor_readout(ctx);
+    return;
+  }
+  int32_t x = point.x - area.x1;
+  if (x < 0) x = 0;
+  if (x >= width) x = width - 1;
+  if (ctx->readout_kind == kReadoutTimeline && ctx->readout_point == x) return;
+
+  const uint64_t span = range_end - range_start;
+  const char* language = configManager.getConfig().language;
+  uint64_t from = range_start;
+  uint64_t to = range_end;
+  const char* binary_label = nullptr;
+  const String* state_value = nullptr;
+  const String& unknown_state = binary_state_identifier_text(2);
+  const String& unavailable_state = binary_state_identifier_text(3);
+  if (!ctx->binary_timeline_bins.empty()) {
+    const auto& bins = ctx->binary_timeline_bins;
+    const size_t count = bins.size();
+    size_t first = static_cast<size_t>(x) * count / static_cast<size_t>(width);
+    size_t last = (static_cast<size_t>(x + 1) * count + static_cast<size_t>(width) - 1U) /
+                  static_cast<size_t>(width);
+    if (first >= count) first = count - 1U;
+    if (last <= first) last = first + 1U;
+    if (last > count) last = count;
+    size_t index = ctx->binary_mode ? first : last - 1U;
+    if (ctx->binary_mode) {
+      for (size_t candidate = first + 1U; candidate < last; ++candidate) {
+        if (binary_state_priority(bins[candidate]) > binary_state_priority(bins[index]))
+          index = candidate;
+      }
+    }
+    const uint8_t state = bins[index];
+    size_t run_first = index;
+    size_t run_last = index;
+    while (run_first > 0 && bins[run_first - 1U] == state) --run_first;
+    while (run_last + 1U < count && bins[run_last + 1U] == state) ++run_last;
+    from = range_start + span * run_first / count;
+    to = range_start + span * (run_last + 1U) / count;
+    if (ctx->binary_mode) {
+      binary_label = i18n::binary_sensor_state_label(
+          language, binary_state_identifier_text(state), ctx->binary_device_class);
+    } else {
+      state_value = state < ctx->state_history_palette.size()
+                        ? &ctx->state_history_palette[state]
+                        : &unknown_state;
+    }
+  } else {
+    const uint64_t time = range_start + span * static_cast<uint64_t>(x) /
+                                            static_cast<uint64_t>(width);
+    const SensorPopupContext::BinarySegment* match = nullptr;
+    for (const auto& segment : ctx->binary_segments) {
+      if (segment.start <= time && time < segment.end) {
+        match = &segment;
+        break;
+      }
+      if (segment.end <= time) {
+        from = std::max(from, segment.end);
+      } else {
+        to = std::min(to, segment.start);
+        break;
+      }
+    }
+    if (match) {
+      from = std::max(match->start, range_start);
+      to = std::min(match->end, range_end);
+      if (ctx->binary_mode) {
+        binary_label = i18n::binary_sensor_state_label(
+            language, binary_state_identifier_text(match->state), ctx->binary_device_class);
+      } else {
+        state_value = &match->value;
+      }
+    } else if (ctx->binary_mode) {
+      // Gaps are drawn in the unavailable color.
+      binary_label = i18n::binary_sensor_state_label(language, unavailable_state,
+                                                     ctx->binary_device_class);
+    } else {
+      state_value = &unavailable_state;
+    }
+  }
+
+  move_readout_cursor(ctx, kReadoutTimeline, x, 0, 0, lv_area_get_height(&area) - 1);
+  ctx->readout_point = x;
+  // Moving within one segment changes only the cursor.
+  if (ctx->readout_from == from && ctx->readout_to == to &&
+      !lv_obj_has_flag(ctx->readout_value_label, LV_OBJ_FLAG_HIDDEN)) return;
+  ctx->readout_from = from;
+  ctx->readout_to = to;
+  const bool with_day = ctx->history_range == SensorHistoryRange::Day7;
+  ctx->readout_time_text[0] = '\0';
+  size_t used = append_readout_time(ctx->readout_time_text, sizeof(ctx->readout_time_text),
+                                    0, from, with_day);
+  if (used) {
+    used = popup_graph_readout::append(ctx->readout_time_text,
+                                       sizeof(ctx->readout_time_text), used,
+                                       popup_graph_readout::kRangeSeparator);
+    append_readout_time(ctx->readout_time_text, sizeof(ctx->readout_time_text), used, to,
+                        with_day);
+  }
+  if (binary_label) {
+    ctx->readout_value_text[0] = '\0';
+    popup_graph_readout::append(ctx->readout_value_text, sizeof(ctx->readout_value_text), 0,
+                                binary_label);
+  } else {
+    write_state_history_label(ctx->readout_value_text, sizeof(ctx->readout_value_text),
+                              state_value ? *state_value : unknown_state);
+  }
+  // A state has no unit (a numeric readout before may have shown one).
+  value_unit::reserve(ctx->readout_value_label, ctx->readout_unit_label, "");
+  show_readout_band(ctx);
+}
+
+static void apply_sensor_readout(SensorPopupContext* ctx, lv_obj_t* target,
+                                 const lv_point_t& point) {
+  if (!is_popup_visible(ctx) || !ctx->readout_time_label || !ctx->readout_value_label) {
+    clear_sensor_readout(ctx);
+    return;
+  }
+  if (target == ctx->chart_wrap) apply_chart_readout(ctx, point);
+  else if (target == ctx->binary_timeline) apply_timeline_readout(ctx, point);
+}
+
+// A finger on the graph: from now on the cursor line shows (issue #139),
+// also where the finger rests on the point already shown.
+static void on_sensor_readout_apply(void* owner, lv_obj_t* target,
+                                    const lv_point_t& point) {
+  auto* ctx = static_cast<SensorPopupContext*>(owner);
+  if (!ctx) return;
+  if (!ctx->readout_touched) {
+    ctx->readout_touched = true;
+    invalidate_readout_cursor(ctx);
+  }
+  apply_sensor_readout(ctx, target, point);
+}
+
+// The graph whose readout stays after release: the numeric chart or the state
+// timeline. Editors keep their controls in the value row, so their readout
+// exists only while a finger is on the graph.
+static lv_obj_t* sensor_readout_graph(const SensorPopupContext* ctx) {
+  if (!ctx || ctx->editable) return nullptr;
+  return ctx->state_history_mode ? ctx->binary_timeline : ctx->chart_wrap;
+}
+
+// The readout shows the newest point: the last real chart point, or the
+// timeline segment that reaches the end of the range.
+static bool sensor_readout_is_latest(const SensorPopupContext* ctx) {
+  if (ctx->readout_kind == kReadoutTimeline) {
+    return ctx->binary_range_end > ctx->binary_range_start &&
+           ctx->readout_to >= ctx->binary_range_end;
+  }
+  if (ctx->readout_kind != kReadoutChart || !ctx->chart || !ctx->series) return false;
+  const uint32_t count = lv_chart_get_point_count(ctx->chart);
+  const int32_t* values = count ? lv_chart_get_series_y_array(ctx->chart, ctx->series) : nullptr;
+  if (!values) return false;
+  for (uint32_t index = count; index-- > 0;) {
+    if (values[index] != LV_CHART_POINT_NONE) return ctx->readout_point == static_cast<int32_t>(index);
+  }
+  return false;
+}
+
+static void on_sensor_readout_end(void* owner, bool keep) {
+  auto* ctx = static_cast<SensorPopupContext*>(owner);
+  if (!ctx) return;
+  lv_obj_t* graph = sensor_readout_graph(ctx);
+  if (keep && graph && readout_target(ctx) == graph) {
+    ctx->readout_pin_x = ctx->readout_x;
+    ctx->readout_latest = sensor_readout_is_latest(ctx);
+    return;
+  }
+  clear_sensor_readout(ctx);
+  if (!keep) {
+    ctx->readout_latest = true;
+    ctx->readout_touched = false;
+  }
+}
+
+// Show the kept readout again after its data changed or the popup opened:
+// the newest point, or the finger's last position. Never while a finger is on
+// the graph, which reads the new data itself.
+static void refresh_sensor_readout(SensorPopupContext* ctx) {
+  lv_obj_t* graph = sensor_readout_graph(ctx);
+  if (!graph || ctx->readout.active() || !is_popup_visible(ctx) ||
+      !ctx->readout_time_label || !ctx->readout_value_label ||
+      lv_obj_has_flag(graph, LV_OBJ_FLAG_HIDDEN)) return;
+  lv_obj_update_layout(graph);
+  lv_area_t area;
+  lv_obj_get_coords(graph, &area);
+  const lv_point_t point = {ctx->readout_latest ? area.x2 : area.x1 + ctx->readout_pin_x,
+                            area.y1};
+  ctx->readout_point = -1;
+  ctx->readout_from = ctx->readout_to = 0;
+  apply_sensor_readout(ctx, graph, point);
+}
+
+// The old value row becomes the readout band: a small time line above the
+// large value line, centered, empty while there is no readout.
+static void build_readout_band(SensorPopupContext* ctx) {
+  if (!ctx || !ctx->value_box || ctx->readout_time_label) return;
+  lv_obj_add_flag(ctx->value_box, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+  ctx->readout_time_label = popup_graph_readout::create_band_label(
+      ctx->value_box, popup_layout::font20(), ctx->readout_time_text);
+  ctx->readout_value_label = popup_graph_readout::create_band_label(
+      ctx->value_box, get_value_font(), ctx->readout_value_text);
+  ctx->readout_unit_label = nullptr;
+  popup_graph_readout::align_band_labels(ctx->readout_time_label,
+                                         ctx->readout_value_label);
+}
+
+// Keep what the readout needs from a numeric history: the exact values (the
+// chart holds integers scaled for its range, which would round large values)
+// and the time span of its linear axis. The PSRAM buffer is reused.
+static void keep_chart_history(SensorPopupContext* ctx, const std::vector<float>& values,
+                               int32_t scale, uint64_t range_start, uint64_t range_end,
+                               uint16_t hours) {
+  ctx->chart_scale = scale > 0 ? scale : 1;
+  ctx->history_values_count = 0;
+  ctx->readout_point = -1;
+  if (values.size() > ctx->history_values_capacity) {
+    heap_caps_free(ctx->history_values);
+    ctx->history_values = static_cast<float*>(heap_caps_malloc(
+        values.size() * sizeof(float), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    ctx->history_values_capacity = ctx->history_values ? values.size() : 0;
+  }
+  if (ctx->history_values && !values.empty()) {
+    memcpy(ctx->history_values, values.data(), values.size() * sizeof(float));
+    ctx->history_values_count = values.size();
+  }
+  if (!range_end) range_end = static_cast<uint64_t>(time(nullptr));
+  if (!range_start || range_start >= range_end)
+    range_start = range_end - static_cast<uint64_t>(hours) * 3600ULL;
+  const bool valid = range_end >= kReadoutMinEpoch && range_start < range_end;
+  ctx->chart_range_start = valid ? range_start : 0;
+  ctx->chart_range_end = valid ? range_end : 0;
+}
+
+static void attach_chart_readout(SensorPopupContext* ctx) {
+  if (!ctx || !ctx->chart_wrap || !ctx->chart) return;
+  ctx->readout.init(ctx, on_sensor_readout_apply, on_sensor_readout_end);
+  // The chart only draws; its own press handling would repaint all of it.
+  lv_obj_remove_flag(ctx->chart, LV_OBJ_FLAG_CLICKABLE);
+  ctx->readout.attach(ctx->chart_wrap);
+  lv_obj_add_event_cb(ctx->chart_wrap, on_readout_cursor_draw, LV_EVENT_DRAW_POST, ctx);
+}
+
+static void attach_timeline_readout(SensorPopupContext* ctx) {
+  if (!ctx || !ctx->binary_timeline) return;
+  ctx->readout.init(ctx, on_sensor_readout_apply, on_sensor_readout_end);
+  ctx->readout.attach(ctx->binary_timeline);
+  lv_obj_set_ext_click_area(ctx->binary_timeline, kTimelineTouchSlop);
+  lv_obj_add_event_cb(ctx->binary_timeline, on_readout_cursor_draw, LV_EVENT_DRAW_POST,
+                      ctx);
+}
+
+static void ensure_binary_view(SensorPopupContext* ctx) {
+  if (!ctx || ctx->binary_body || !ctx->body_box) {
+    if (ctx && ctx->binary_body) refresh_binary_labels(ctx);
+    return;
+  }
+
+  lv_obj_t* body = lv_obj_create(ctx->body_box);
+  ctx->binary_body = body;
+  lv_obj_remove_style_all(body);
+  lv_obj_set_size(body, LV_PCT(100), LV_PCT(100));
+  lv_obj_center(body);
+  lv_obj_set_style_bg_opa(body, LV_OPA_TRANSP, 0);
+  lv_obj_clear_flag(body, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+
+  const int section_font_height = popup_layout::scale(28);
+  const int timeline_y = section_font_height + popup_layout::scale(14);
+  const int axis_y = timeline_y + kBinaryTimelineHeight +
+                     popup_layout::scale(6);
+  const int activity_title_y =
+      axis_y + lv_font_get_line_height(popup_layout::font20()) +
+      popup_layout::scale(12);
+  const int activity_date_y = activity_title_y + section_font_height +
+                              popup_layout::scale(4);
+  const int activity_rows_y =
+      activity_date_y + lv_font_get_line_height(popup_layout::font20()) +
+      popup_layout::scale(6);
+  const int activity_view_height = std::max(
+      kBinaryActivityRowHeight,
+      popup_layout::kBodyHeight - activity_rows_y);
+
+  ctx->binary_history_title = lv_label_create(body);
+  set_label_style(ctx->binary_history_title, lv_color_hex(ui_theme::text()),
+                  popup_layout::font24());
+  lv_obj_set_pos(ctx->binary_history_title, 0, 0);
+
+  ctx->binary_timeline = lv_obj_create(body);
+  lv_obj_remove_style_all(ctx->binary_timeline);
+  lv_obj_set_size(ctx->binary_timeline, LV_PCT(100), kBinaryTimelineHeight);
+  lv_obj_set_pos(ctx->binary_timeline, 0, timeline_y);
+  lv_obj_set_style_bg_color(ctx->binary_timeline,
+                            lv_color_hex(kBinaryUnavailableColor), 0);
+  lv_obj_set_style_bg_opa(ctx->binary_timeline, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(ctx->binary_timeline, 0, 0);
+  lv_obj_set_style_clip_corner(ctx->binary_timeline, false, 0);
+  lv_obj_set_style_border_width(ctx->binary_timeline, 0, 0);
+  lv_obj_set_style_outline_width(ctx->binary_timeline, 0, 0);
+  lv_obj_set_style_pad_all(ctx->binary_timeline, 0, 0);
+  lv_obj_clear_flag(ctx->binary_timeline, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(ctx->binary_timeline, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(ctx->binary_timeline, on_binary_timeline_draw,
+                      LV_EVENT_DRAW_MAIN, ctx);
+  attach_timeline_readout(ctx);
+
+  ctx->binary_history_status = lv_label_create(body);
+  set_label_style(ctx->binary_history_status, lv_color_hex(ui_theme::text()),
+                  popup_layout::font20());
+  lv_obj_set_style_text_opa(ctx->binary_history_status, LV_OPA_70, 0);
+  lv_obj_set_width(ctx->binary_history_status, LV_PCT(100));
+  lv_obj_set_style_text_align(ctx->binary_history_status,
+                              LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_y(ctx->binary_history_status,
+               timeline_y + (kBinaryTimelineHeight / 2) -
+                   popup_layout::scale(10));
+
+  for (int index = 0; index < kTimeAxisMarkerCount; ++index) {
+    lv_obj_t* label = lv_label_create(body);
+    ctx->binary_time_labels[index] = label;
+    set_label_style(label, lv_color_hex(ui_theme::text()), popup_layout::font20());
+    lv_label_set_text(label, "");
+    lv_obj_set_style_text_opa(label, LV_OPA_COVER, 0);
+    lv_obj_set_y(label, axis_y);
+    lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  ctx->binary_activity_title = lv_label_create(body);
+  set_label_style(ctx->binary_activity_title, lv_color_hex(ui_theme::text()),
+                  popup_layout::font24());
+  lv_obj_set_pos(ctx->binary_activity_title, 0, activity_title_y);
+
+  ctx->binary_activity_date = lv_label_create(body);
+  set_label_style(ctx->binary_activity_date, lv_color_hex(ui_theme::text()),
+                  popup_layout::font20());
+  lv_obj_set_pos(ctx->binary_activity_date, 0, activity_date_y);
+  lv_obj_set_width(ctx->binary_activity_date, LV_PCT(100));
+  lv_label_set_long_mode(ctx->binary_activity_date, LV_LABEL_LONG_DOT);
+  lv_obj_add_flag(ctx->binary_activity_date, LV_OBJ_FLAG_HIDDEN);
+
+  ctx->binary_activity_status = lv_label_create(body);
+  set_label_style(ctx->binary_activity_status, lv_color_hex(ui_theme::text()),
+                  popup_layout::font20());
+  lv_obj_set_style_text_opa(ctx->binary_activity_status, LV_OPA_60, 0);
+  lv_obj_set_width(ctx->binary_activity_status, LV_PCT(100));
+  lv_obj_set_style_text_align(ctx->binary_activity_status,
+                              LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_y(ctx->binary_activity_status,
+               activity_rows_y + popup_layout::scale(8));
+  lv_obj_add_flag(ctx->binary_activity_status, LV_OBJ_FLAG_HIDDEN);
+
+  const int dot_size = popup_layout::scale(10);
+  const int dot_x = popup_layout::scale(12);
+  const int state_x = popup_layout::scale(28);
+  lv_obj_t* viewport = lv_obj_create(body);
+  ctx->binary_activity_viewport = viewport;
+  lv_obj_remove_style_all(viewport);
+  lv_obj_set_size(viewport, LV_PCT(100), activity_view_height);
+  lv_obj_set_pos(viewport, 0, activity_rows_y);
+  lv_obj_set_style_bg_opa(viewport, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_bg_color(viewport, lv_color_hex(kBinaryInactiveColor),
+                            LV_PART_SCROLLBAR);
+  lv_obj_set_style_bg_opa(viewport, LV_OPA_50, LV_PART_SCROLLBAR);
+  lv_obj_set_style_width(viewport, popup_layout::scale(5),
+                         LV_PART_SCROLLBAR);
+  lv_obj_set_style_radius(viewport, LV_RADIUS_CIRCLE, LV_PART_SCROLLBAR);
+  lv_obj_set_scroll_dir(viewport, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(viewport, LV_SCROLLBAR_MODE_AUTO);
+  lv_obj_clear_flag(viewport, LV_OBJ_FLAG_SCROLL_CHAIN);
+  lv_obj_add_flag(
+      viewport,
+      static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_SCROLLABLE |
+                                 LV_OBJ_FLAG_SCROLL_ELASTIC |
+                                 LV_OBJ_FLAG_SCROLL_MOMENTUM));
+  lv_obj_add_event_cb(viewport, on_binary_activity_scroll, LV_EVENT_SCROLL,
+                      ctx);
+
+  lv_obj_t* spacer = lv_obj_create(viewport);
+  ctx->binary_activity_spacer = spacer;
+  lv_obj_remove_style_all(spacer);
+  lv_obj_set_size(spacer, 1, activity_view_height);
+  lv_obj_set_pos(spacer, 0, 0);
+  lv_obj_clear_flag(spacer, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(spacer, LV_OBJ_FLAG_SCROLLABLE);
+
+  for (int index = 0; index < kBinaryActivityPoolRows; ++index) {
+    ctx->binary_activity_row_indices[index] = kBinaryMaxActivityEntries;
+    lv_obj_t* row = lv_obj_create(viewport);
+    ctx->binary_activity_rows[index] = row;
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LV_PCT(100), kBinaryActivityRowHeight);
+    lv_obj_set_pos(row, 0, index * kBinaryActivityRowHeight);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t* line = lv_obj_create(row);
+    ctx->binary_activity_lines[index] = line;
+    lv_obj_remove_style_all(line);
+    lv_obj_set_size(line, 1, kBinaryActivityRowHeight);
+    lv_obj_set_pos(line, dot_x + (dot_size / 2), 0);
+    lv_obj_set_style_bg_color(line, lv_color_hex(kBinaryInactiveColor), 0);
+    lv_obj_set_style_bg_opa(line, LV_OPA_30, 0);
+    lv_obj_clear_flag(line, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* dot = lv_obj_create(row);
+    ctx->binary_activity_dots[index] = dot;
+    lv_obj_remove_style_all(dot);
+    lv_obj_set_size(dot, dot_size, dot_size);
+    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+    lv_obj_align(dot, LV_ALIGN_LEFT_MID, dot_x, 0);
+    lv_obj_clear_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* state_label = lv_label_create(row);
+    ctx->binary_activity_states[index] = state_label;
+    set_label_style(state_label, lv_color_hex(ui_theme::text()), popup_layout::font20());
+    lv_label_set_long_mode(state_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(state_label, LV_PCT(50));
+    lv_obj_align(state_label, LV_ALIGN_LEFT_MID, state_x, 0);
+
+    lv_obj_t* time_label = lv_label_create(row);
+    ctx->binary_activity_times[index] = time_label;
+    set_label_style(time_label, lv_color_hex(ui_theme::text()), popup_layout::font20());
+    lv_obj_set_style_text_opa(time_label, LV_OPA_60, 0);
+    lv_obj_set_style_text_align(time_label, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_width(time_label, LV_PCT(42));
+    lv_obj_align(time_label, LV_ALIGN_RIGHT_MID,
+                 -popup_layout::scale(12), 0);
+
+    lv_obj_t* divider = lv_obj_create(row);
+    ctx->binary_activity_dividers[index] = divider;
+    lv_obj_remove_style_all(divider);
+    lv_obj_set_size(divider, LV_PCT(94), 1);
+    lv_obj_align(divider, LV_ALIGN_BOTTOM_RIGHT,
+                 -popup_layout::scale(12), 0);
+    lv_obj_set_style_bg_color(divider, lv_color_hex(ui_theme::icon()), 0);
+    lv_obj_set_style_bg_opa(divider, LV_OPA_10, 0);
+    lv_obj_clear_flag(divider, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(divider, LV_OBJ_FLAG_SCROLLABLE);
+  }
+
+  lv_obj_update_layout(body);
+  refresh_binary_labels(ctx);
+  clear_binary_history(ctx);
+}
+
+static int binary_timeline_hex_nibble(char value) {
+  if (value >= '0' && value <= '9') return value - '0';
+  if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+  if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+  return -1;
+}
+
+static bool decode_binary_timeline(JsonVariantConst points_value,
+                                   JsonVariantConst encoding_value,
+                                   JsonVariantConst data_value,
+                                   PsVector<uint8_t>& output) {
+  output.clear();
+  if (!points_value.is<uint16_t>() || !encoding_value.is<const char*>() ||
+      !data_value.is<const char*>()) {
+    return false;
+  }
+  const uint16_t points = points_value.as<uint16_t>();
+  const char* encoding = encoding_value.as<const char*>();
+  const char* data = data_value.as<const char*>();
+  if (!points || points > kBinaryMaxTimelineBins || !encoding || !data ||
+      strcmp(encoding, "2bit-hex") != 0) {
+    return false;
+  }
+  const size_t encoded_bytes = (static_cast<size_t>(points) + 3U) / 4U;
+  const size_t expected_chars = encoded_bytes * 2U;
+  if (strlen(data) != expected_chars) return false;
+
+  output.reserve(points);
+  for (size_t byte_index = 0; byte_index < encoded_bytes; ++byte_index) {
+    const int high = binary_timeline_hex_nibble(data[byte_index * 2U]);
+    const int low = binary_timeline_hex_nibble(data[byte_index * 2U + 1U]);
+    if (high < 0 || low < 0) {
+      output.clear();
+      return false;
+    }
+    const uint8_t packed = static_cast<uint8_t>((high << 4) | low);
+    for (int shift = 6; shift >= 0 && output.size() < points; shift -= 2) {
+      output.push_back(static_cast<uint8_t>((packed >> shift) & 0x03U));
+    }
+  }
+  return output.size() == points;
+}
+
+static bool decode_state_timeline(JsonVariantConst points_value,
+                                  JsonVariantConst encoding_value,
+                                  JsonVariantConst data_value,
+                                  const PsVector<String>& palette,
+                                  PsVector<uint8_t>& output) {
+  output.clear();
+  if (!points_value.is<uint16_t>() || !encoding_value.is<const char*>() ||
+      !data_value.is<const char*>() || palette.empty() ||
+      palette.size() > kStateHistoryMaxPaletteEntries) {
+    return false;
+  }
+  const uint16_t points = points_value.as<uint16_t>();
+  const char* encoding = encoding_value.as<const char*>();
+  const char* data = data_value.as<const char*>();
+  if (!points || points > kBinaryMaxTimelineBins || !encoding || !data ||
+      strcmp(encoding, "palette4-hex") != 0) {
+    return false;
+  }
+
+  const size_t expected_chars =
+      ((static_cast<size_t>(points) + 1U) / 2U) * 2U;
+  if (strlen(data) != expected_chars) return false;
+
+  output.reserve(points);
+  for (size_t index = 0; index < static_cast<size_t>(points); ++index) {
+    const int code = binary_timeline_hex_nibble(data[index]);
+    if (code < 0 || static_cast<size_t>(code) >= palette.size()) {
+      output.clear();
+      return false;
+    }
+    output.push_back(static_cast<uint8_t>(code));
+  }
+  return output.size() == points;
+}
+
+static void apply_binary_history_payload(SensorPopupContext* ctx,
+                                         DynamicJsonDocument& doc) {
+  if (!ctx) return;
+  const HistoryRangeConfig range_cfg =
+      get_history_range_config(ctx->history_range);
+  const uint16_t payload_hours = doc["hours"] | range_cfg.hours;
+  if (payload_hours != range_cfg.hours) return;
+
+  const JsonVariantConst device_class_variant = doc["device_class"];
+  const String device_class =
+      doc.containsKey("device_class") && device_class_variant.isNull()
+          ? String()
+          : String(device_class_variant |
+                   ctx->binary_device_class.c_str());
+  const JsonVariantConst current_variant = doc["current"];
+  const String current =
+      doc.containsKey("current") && current_variant.isNull()
+          ? String()
+          : String(current_variant | ctx->binary_state.c_str());
+  const JsonVariantConst available_variant = doc["available"];
+  const bool available =
+      doc.containsKey("available") && available_variant.isNull()
+          ? false
+          : (available_variant | ctx->binary_available);
+  const JsonVariantConst last_changed_variant = doc["last_changed"];
+  const bool clear_last_changed =
+      doc.containsKey("last_changed") && last_changed_variant.isNull();
+  const uint64_t last_changed = extract_epoch(last_changed_variant);
+  update_binary_state(ctx, current, available, device_class,
+                      clear_last_changed
+                          ? 0
+                          : (last_changed ? last_changed
+                                          : ctx->binary_last_changed),
+                      "");
+
+  const bool history_available =
+      doc.containsKey("error") ? false : (doc["history_available"] | true);
+  ctx->binary_segments.clear();
+  ctx->binary_timeline_bins.clear();
+  ctx->binary_range_start = extract_epoch(doc["range_start"]);
+  ctx->binary_range_end = extract_epoch(doc["range_end"]);
+  if (!ctx->binary_range_end) {
+    ctx->binary_range_end = static_cast<uint64_t>(time(nullptr));
+  }
+  if (!ctx->binary_range_start && ctx->binary_range_end) {
+    ctx->binary_range_start =
+        ctx->binary_range_end - (static_cast<uint64_t>(payload_hours) * 3600ULL);
+  }
+
+  if (history_available) {
+    decode_binary_timeline(doc["timeline_points"],
+                           doc["timeline_encoding"],
+                           doc["timeline_data"],
+                           ctx->binary_timeline_bins);
+  }
+
+  JsonArrayConst segments = doc["segments"].as<JsonArrayConst>();
+  if (history_available && !segments.isNull()) {
+    ctx->binary_segments.reserve(
+        std::min(segments.size(), kBinaryMaxSegments));
+    for (JsonObjectConst item : segments) {
+      if (ctx->binary_segments.size() >= kBinaryMaxSegments) break;
+      SensorPopupContext::BinarySegment segment;
+      segment.start = extract_epoch(item["start"]);
+      segment.end = extract_epoch(item["end"]);
+      String state = String(item["state"] | "unknown");
+      segment.state = binary_state_code(state);
+      segment.value = binary_state_identifier(segment.state);
+      if (!segment.start || !segment.end || segment.end <= segment.start) {
+        continue;
+      }
+      ctx->binary_segments.push_back(segment);
+    }
+    std::sort(ctx->binary_segments.begin(), ctx->binary_segments.end(),
+              [](const SensorPopupContext::BinarySegment& left,
+                 const SensorPopupContext::BinarySegment& right) {
+                return left.start < right.start;
+              });
+  }
+
+  JsonArrayConst activity = doc["activity"].as<JsonArrayConst>();
+  ctx->binary_activity.clear();
+  if (history_available && !activity.isNull()) {
+    ctx->binary_activity.reserve(
+        std::min(activity.size(), kBinaryMaxActivityEntries));
+    for (int source_index = static_cast<int>(activity.size()) - 1;
+         source_index >= 0 &&
+         ctx->binary_activity.size() < kBinaryMaxActivityEntries;
+         --source_index) {
+      JsonObjectConst item = activity[source_index].as<JsonObjectConst>();
+      const uint64_t timestamp = extract_epoch(item["timestamp"]);
+      String state = String(item["state"] | "unknown");
+      if (!timestamp) continue;
+      SensorPopupContext::BinaryActivityEntry entry;
+      entry.timestamp = timestamp;
+      entry.state = binary_state_code(state);
+      entry.value = binary_state_identifier(entry.state);
+      ctx->binary_activity.push_back(entry);
+    }
+  }
+
+  ctx->binary_activity_first_row = kBinaryMaxActivityEntries;
+  if (ctx->binary_activity_viewport) {
+    const int viewport_height = std::max(
+        kBinaryActivityRowHeight,
+        static_cast<int>(lv_obj_get_height(ctx->binary_activity_viewport)));
+    const int content_height = std::max(
+        viewport_height,
+        static_cast<int>(ctx->binary_activity.size()) *
+            kBinaryActivityRowHeight);
+    if (ctx->binary_activity_spacer) {
+      lv_obj_set_height(ctx->binary_activity_spacer, content_height);
+    }
+    lv_obj_update_layout(ctx->binary_activity_viewport);
+    lv_obj_scroll_to_y(ctx->binary_activity_viewport, 0, LV_ANIM_OFF);
+  }
+  refresh_binary_activity_rows(ctx, true);
+
+  if (ctx->binary_activity_status) {
+    if (history_available && ctx->binary_activity.empty()) {
+      lv_label_set_text(
+          ctx->binary_activity_status,
+          i18n::binary_sensor_label(configManager.getConfig().language, 5));
+      lv_obj_clear_flag(ctx->binary_activity_status, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(ctx->binary_activity_status, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+
+  if (ctx->binary_history_status) {
+    if (!history_available) {
+      lv_label_set_text(
+          ctx->binary_history_status,
+          i18n::binary_sensor_label(configManager.getConfig().language, 4));
+      lv_obj_clear_flag(ctx->binary_history_status, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(ctx->binary_history_status, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+  set_range_buttons_visible(ctx, true);
+  update_binary_time_axis(ctx);
+  if (ctx->binary_timeline) lv_obj_invalidate(ctx->binary_timeline);
+}
+
+
+static void resize_editable_chart(SensorPopupContext* ctx, int height) {
+  if (!ctx->chart_wrap || !ctx->chart) return;
+  constexpr int overhang = popup_layout::contentScale(12);
+  lv_obj_set_height(ctx->chart_wrap, height + 2 * overhang + kTimeAxisHeight);
+  // The graph gives up the time labels' extra room (kTimeLabelExtra).
+  height = std::max(1, height - kTimeLabelExtra);
+  ctx->chart_height = height;
+  lv_obj_set_height(ctx->chart, height + 2 * kChartLinePad);
+  if (ctx->y_min_label) lv_obj_set_y(ctx->y_min_label, height);
+  for (int i = 0; i < kTimeAxisMarkerCount; ++i) {
+    if (ctx->time_labels[i]) lv_obj_set_y(ctx->time_labels[i], overhang + height + kTimeLabelGap);
+  }
+  place_zero_label(ctx);
+}
+
+static int editable_control_top(const SensorPopupContext* ctx) {
+  // Include the close button's invisible touch extension and wrapped titles.
+  int header_bottom = std::max(popup_layout::kHeaderHeight,
+      popup_layout::kCloseButtonOffsetY + popup_layout::kCloseButtonSize +
+          popup_layout::kCloseButtonClickArea);
+  for (auto* label : {ctx->title_label, ctx->icon_label}) {
+    if (label && !lv_obj_has_flag(label, LV_OBJ_FLAG_HIDDEN)) {
+      header_bottom = std::max<int>(header_bottom,
+          lv_obj_get_y(label) + lv_obj_get_height(label));
+    }
+  }
+  return std::max(popup_layout::kValueY, header_bottom + popup_layout::scale(6));
+}
+
+static void layout_editable_history(SensorPopupContext* ctx) {
+  if (!ctx || !ctx->body_box) return;
+  const bool numeric = ctx->editable && ctx->editable_kind == "number";
+  const bool temporal = ctx->editable && ctx->editable_kind != "select" && !numeric;
+  const int section_height = popup_layout::scale(28);
+  const int timeline_y = section_height + popup_layout::scale(14);
+  const int axis_y = timeline_y + kBinaryTimelineHeight + popup_layout::scale(6);
+  const int default_activity_y = axis_y + lv_font_get_line_height(popup_layout::font20()) + popup_layout::scale(12);
+  const int control_y = ctx->editable ? editable_control_top(ctx) : popup_layout::kValueY;
+  if (ctx->editable && ctx->control_row) lv_obj_set_y(ctx->control_row, control_y);
+  const int body_y = ctx->editable ? control_y + editable_control_height(ctx->editable_kind) +
+                                   popup_layout::scale(8) : popup_layout::kBodyY;
+  // Both children are positioned inside the padded card. Reserve the actual
+  // footer bounds, so the graph and Activity never require an outer scroll.
+  const int content_lift = ctx->editable ? 0 : kContentLiftY;
+  const int body_height = ctx->editable ? popup_layout::kNavY - 2 * popup_layout::kCardPad -
+                                         popup_layout::scale(12) - body_y + content_lift : popup_layout::kBodyHeight;
+  lv_obj_set_height(ctx->body_box, body_height);
+  lv_obj_align(ctx->body_box, LV_ALIGN_TOP_MID, 0, body_y - content_lift);
+  lv_obj_scroll_to_y(ctx->body_box, 0, LV_ANIM_OFF);
+  lv_obj_remove_flag(ctx->body_box, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scrollbar_mode(ctx->body_box, LV_SCROLLBAR_MODE_OFF);
+  if (ctx->editable) lv_obj_remove_flag(ctx->body_box, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+  else lv_obj_add_flag(ctx->body_box, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+  const int activity_heading = section_height + popup_layout::scale(4) +
+                               lv_font_get_line_height(popup_layout::font20()) + popup_layout::scale(6);
+  const int chart_extra = popup_layout::contentScale(24) + kTimeAxisHeight + popup_layout::scale(12);
+  const int reserved_rows = SCREEN_HEIGHT <= 600 ? 2 : 3;
+  // Reclaimed control spacing belongs to Activity, not a taller graph.
+  const int chart_limit = popup_layout::contentScale(SCREEN_HEIGHT <= 600 ? 60 : 90);
+  const int chart_height = numeric ? std::max(40, std::min(chart_limit,
+      body_height - timeline_y - chart_extra - activity_heading - reserved_rows * kBinaryActivityRowHeight)) : kChartHeight;
+  resize_editable_chart(ctx, chart_height);
+  if (numeric) {
+    lv_obj_align(ctx->chart_wrap, LV_ALIGN_TOP_MID, 0, timeline_y);
+    lv_obj_remove_flag(ctx->chart_wrap, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(ctx->chart_wrap);
+  } else {
+    lv_obj_center(ctx->chart_wrap);
+    if (ctx->state_history_mode) lv_obj_add_flag(ctx->chart_wrap, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_remove_flag(ctx->chart_wrap, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (!ctx->binary_body) return;
+  auto show = [](lv_obj_t* obj, bool visible) {
+    if (!obj) return;
+    if (visible) lv_obj_remove_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+  };
+  const int activity_y = temporal ? popup_layout::scale(8) : numeric ? timeline_y + chart_height + chart_extra : default_activity_y;
+  const int date_y = activity_y + section_height + popup_layout::scale(4);
+  const int rows_y = activity_y + activity_heading;
+  const int viewport_height = std::max(kBinaryActivityRowHeight, body_height - rows_y);
+  lv_obj_set_size(ctx->binary_body, LV_PCT(100), body_height);
+  lv_obj_align(ctx->binary_body, LV_ALIGN_TOP_MID, 0, 0);
+  lv_obj_set_y(ctx->binary_activity_title, activity_y);
+  lv_obj_set_y(ctx->binary_activity_date, date_y);
+  lv_obj_set_y(ctx->binary_activity_viewport, rows_y);
+  lv_obj_set_height(ctx->binary_activity_viewport, viewport_height);
+  lv_obj_set_y(ctx->binary_activity_status, rows_y);
+  show(ctx->binary_history_title, !temporal);
+  show(ctx->binary_timeline, !numeric && !temporal);
+  // Categorical history retains its compact bar and axis spacing, leaving
+  // the space that a numeric graph would occupy available for Activity.
+  lv_obj_set_y(ctx->binary_timeline, timeline_y);
+  for (auto* time_label : ctx->binary_time_labels) {
+    if (time_label) lv_obj_set_y(time_label, axis_y);
+  }
+  if (numeric || temporal) {
+    for (auto* time_label : ctx->binary_time_labels) show(time_label, false);
+  } else {
+    // Only the current range's axis calculation may expose labels. Showing the
+    // entire pool resurrects default text and leftover seven-day markers.
+    update_binary_time_axis(ctx);
+  }
+  lv_obj_set_y(ctx->binary_history_status, temporal ? rows_y : timeline_y);
+  lv_obj_update_layout(ctx->body_box);
+}
+
+static void apply_state_history_payload(SensorPopupContext* ctx,
+                                        DynamicJsonDocument& doc) {
+  if (!ctx) return;
+  const HistoryRangeConfig range_cfg =
+      get_history_range_config(ctx->history_range);
+  const uint16_t payload_hours = doc["hours"] | range_cfg.hours;
+  if (payload_hours != range_cfg.hours) return;
+
+  ctx->binary_mode = false;
+  ctx->state_history_mode = true;
+  ensure_binary_view(ctx);
+  // Editable Numbers share Activity parsing with categorical histories but
+  // retain their numeric graph. Visibility must not depend on a later layout.
+  if (ctx->chart_wrap) {
+    if (ctx->editable && ctx->editable_kind == "number") {
+      lv_obj_remove_flag(ctx->chart_wrap, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(ctx->chart_wrap, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+  if (ctx->binary_body) lv_obj_clear_flag(ctx->binary_body, LV_OBJ_FLAG_HIDDEN);
+
+  if (!ctx->editable && doc.containsKey("current")) {
+    const JsonVariantConst current_variant = doc["current"];
+    ctx->state_history_value =
+        current_variant.isNull()
+            ? String()
+            : normalize_state_live_value(
+                  String(current_variant.as<const char*>()));
+    update_value_label(ctx, ctx->state_history_value, ctx->unit);
+  }
+
+  const bool history_available =
+      doc.containsKey("error") ? false : (doc["history_available"] | true);
+  ctx->binary_segments.clear();
+  ctx->binary_timeline_bins.clear();
+  ctx->state_history_palette.clear();
+  ctx->state_history_palette_complete = doc["palette_complete"] | true;
+  if (!ctx->state_history_palette_complete) {
+    Serial.printf(
+        "[StateHistory] Palette limit reached for %s; overflow is shown as unknown\n",
+        ctx->entity_id.c_str());
+  }
+  ctx->binary_range_start = extract_epoch(doc["range_start"]);
+  ctx->binary_range_end = extract_epoch(doc["range_end"]);
+  if (!ctx->binary_range_end) {
+    ctx->binary_range_end = static_cast<uint64_t>(time(nullptr));
+  }
+  if (!ctx->binary_range_start && ctx->binary_range_end) {
+    ctx->binary_range_start =
+        ctx->binary_range_end - (static_cast<uint64_t>(payload_hours) * 3600ULL);
+  }
+
+  const JsonArrayConst palette = doc["palette"].as<JsonArrayConst>();
+  if (history_available && !palette.isNull() &&
+      palette.size() <= kStateHistoryMaxPaletteEntries) {
+    ctx->state_history_palette.reserve(palette.size());
+    for (JsonVariantConst item : palette) {
+      if (!item.is<const char*>()) {
+        ctx->state_history_palette.clear();
+        break;
+      }
+      ctx->state_history_palette.push_back(
+          normalize_state_history_value(String(item.as<const char*>())));
+    }
+  }
+  if (history_available) {
+    decode_state_timeline(doc["timeline_points"],
+                          doc["timeline_encoding"],
+                          doc["timeline_data"],
+                          ctx->state_history_palette,
+                          ctx->binary_timeline_bins);
+  }
+
+  const JsonArrayConst segments = doc["segments"].as<JsonArrayConst>();
+  if (history_available && !segments.isNull()) {
+    ctx->binary_segments.reserve(
+        std::min(segments.size(), kBinaryMaxSegments));
+    for (JsonObjectConst item : segments) {
+      if (ctx->binary_segments.size() >= kBinaryMaxSegments) break;
+      SensorPopupContext::BinarySegment segment;
+      segment.start = extract_epoch(item["start"]);
+      segment.end = extract_epoch(item["end"]);
+      segment.value = normalize_state_history_value(
+          String(item["state"] | "unknown"));
+      if (!segment.start || !segment.end || segment.end <= segment.start) {
+        continue;
+      }
+      ctx->binary_segments.push_back(segment);
+    }
+    std::sort(ctx->binary_segments.begin(), ctx->binary_segments.end(),
+              [](const SensorPopupContext::BinarySegment& left,
+                 const SensorPopupContext::BinarySegment& right) {
+                return left.start < right.start;
+              });
+  }
+
+  const JsonArrayConst activity = doc["activity"].as<JsonArrayConst>();
+  ctx->binary_activity.clear();
+  if (history_available && !activity.isNull()) {
+    ctx->binary_activity.reserve(
+        std::min(activity.size(), kBinaryMaxActivityEntries));
+    for (int source_index = static_cast<int>(activity.size()) - 1;
+         source_index >= 0 &&
+         ctx->binary_activity.size() < kBinaryMaxActivityEntries;
+         --source_index) {
+      const JsonObjectConst item = activity[source_index].as<JsonObjectConst>();
+      const uint64_t timestamp = extract_epoch(item["timestamp"]);
+      if (!timestamp) continue;
+      SensorPopupContext::BinaryActivityEntry entry;
+      entry.timestamp = timestamp;
+      entry.value = normalize_state_history_value(
+          String(item["state"] | "unknown"));
+      ctx->binary_activity.push_back(entry);
+    }
+  }
+
+  ctx->binary_activity_first_row = kBinaryMaxActivityEntries;
+  ctx->binary_activity_date_key = 0;
+  for (int index = 0; index < kBinaryActivityPoolRows; ++index) {
+    ctx->binary_activity_row_indices[index] = kBinaryMaxActivityEntries;
+  }
+  if (ctx->binary_activity_viewport) {
+    const int viewport_height = std::max(
+        kBinaryActivityRowHeight,
+        static_cast<int>(lv_obj_get_height(ctx->binary_activity_viewport)));
+    const int content_height = std::max(
+        viewport_height,
+        static_cast<int>(ctx->binary_activity.size()) *
+            kBinaryActivityRowHeight);
+    if (ctx->binary_activity_spacer) {
+      lv_obj_set_height(ctx->binary_activity_spacer, content_height);
+    }
+    lv_obj_update_layout(ctx->binary_activity_viewport);
+    lv_obj_scroll_to_y(ctx->binary_activity_viewport, 0, LV_ANIM_OFF);
+  }
+  refresh_binary_activity_rows(ctx, true);
+
+  if (ctx->binary_activity_status) {
+    if (history_available && ctx->binary_activity.empty()) {
+      lv_label_set_text(
+          ctx->binary_activity_status,
+          i18n::binary_sensor_label(configManager.getConfig().language, 5));
+      lv_obj_clear_flag(ctx->binary_activity_status, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(ctx->binary_activity_status, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+  if (ctx->binary_history_status) {
+    if (!history_available) {
+      lv_label_set_text(
+          ctx->binary_history_status,
+          i18n::binary_sensor_label(configManager.getConfig().language, 4));
+      lv_obj_clear_flag(ctx->binary_history_status, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(ctx->binary_history_status, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+  set_range_buttons_visible(ctx, true);
+  if (!ctx->editable || ctx->editable_kind == "select") update_binary_time_axis(ctx);
+  if (ctx->binary_timeline) lv_obj_invalidate(ctx->binary_timeline);
+}
+
+static bool accept_editable_history_range(SensorPopupContext* ctx, DynamicJsonDocument& doc) {
+  if (!ctx->editable_history_id.length() || ctx->editable_history_id != (doc["request_id"] | "")) return false;
+  const auto requested = get_history_range_config(ctx->editable_requested_range);
+  if ((doc["hours"] | 0) != requested.hours) return false;
+  // Keep the displayed range and its data intact until the matching reply is
+  // ready. Slow Recorder responses must not blank or resize the popup.
+  ctx->history_range = ctx->editable_requested_range;
+  update_range_buttons(ctx);
+  return true;
+}
+
+static void apply_history_payload(SensorPopupContext* ctx, const char* payload) {
+  if (!ctx || !payload || !*payload) return;
+
+  const uint32_t apply_started_ms = millis();
+  // Discrete responses are bounded to 96 timeline segments and 96 activity
+  // entries. Numeric histories continue to use the same transient document.
+  DynamicJsonDocument doc(24576);
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.printf("[SensorPopup] History JSON error: %s\n", err.c_str());
+    return;
+  }
+  const uint32_t parsed_ms = millis();
+
+  const char* entity = doc["entity_id"] | "";
+  if (!ctx->entity_id.equalsIgnoreCase(entity)) {
+    return;
+  }
+
+  if (ctx->editable) {
+    const bool available = !doc.containsKey("error") && (doc["history_available"] | true);
+    const auto requested = get_history_range_config(ctx->editable_requested_range);
+    // Validate before changing the displayed range or cached Activity. Recorder
+    // errors intentionally have no values array and must still reach the UI.
+    if (ctx->editable_kind == "number" && available &&
+        (!doc["values"].is<JsonArray>() || doc["values"].size() > kHistoryPoints24h ||
+         (doc["period_minutes"] | requested.period_minutes) != requested.period_minutes)) return;
+    if (!accept_editable_history_range(ctx, doc)) return;
+    apply_state_history_payload(ctx, doc);
+    ctx->history_loaded = available;
+    ctx->history_loaded_ms = millis();
+    ctx->history_fingerprint = ctx->history_request_fingerprint;
+    ctx->history_language = configManager.getConfig().language;
+    ctx->history_kind = ctx->editable_kind;
+    ctx->history_unit = ctx->unit;
+    // Editor geometry is established on open/kind changes. A history response
+    // changes data and axes, not the control, graph or Activity allocation.
+    if (ctx->editable_kind != "number") return;
+    if (!available) { clear_chart(ctx, requested.points); return; }
+  }
+  const char* kind = doc["kind"] | "";
+  if (strcmp(kind, "binary") == 0) {
+    if (!ctx->binary_mode) return;
+    apply_binary_history_payload(ctx, doc);
+    refresh_sensor_readout(ctx);
+    return;
+  }
+  if (strcmp(kind, "state") == 0) {
+    if (ctx->binary_mode || ctx->editable) return;
+    apply_state_history_payload(ctx, doc);
+    refresh_sensor_readout(ctx);
+    return;
+  }
+  if (ctx->state_history_mode && !ctx->editable) return;
+
+  if (!ctx->lock_unit && doc.containsKey("unit")) {
+    String unit = String(doc["unit"].as<const char*>());
+    unit.trim();
+    if (!unit.isEmpty()) {
+      ctx->unit = unit;
+    }
+  }
+
+  const HistoryRangeConfig range_cfg = get_history_range_config(ctx->history_range);
+  const uint16_t payload_hours = doc["hours"] | range_cfg.hours;
+  const uint16_t payload_period_minutes = doc["period_minutes"] | range_cfg.period_minutes;
+  if (payload_hours != range_cfg.hours || payload_period_minutes != range_cfg.period_minutes) {
+    return;
+  }
+
+  if (!ctx->editable && doc.containsKey("current")) {
+    String current = String(doc["current"].as<const char*>());
+    update_value_label(ctx, current, ctx->unit);
+  }
+
+  JsonArray values = doc["values"].as<JsonArray>();
+  if (values.isNull()) {
+    return;
+  }
+
+  size_t count = values.size();
+  if (ctx->editable && count > 288) return;
+  if (count == 0) {
+    set_range_buttons_visible(ctx, ctx->editable);
+    clear_chart(ctx, range_cfg.points);
+    return;
+  }
+
+  uint16_t points = static_cast<uint16_t>(count);
+
+  std::vector<float> plot_values(count, NAN);
+  for (size_t i = 0; i < count; ++i) {
+    JsonVariant v = values[i];
+    float val = 0.0f;
+    if (extract_numeric(v, val) && (!ctx->editable || fabsf(val) < 100000000.0f)) {
+      plot_values[i] = val;
+    }
+  }
+
+  // Fill gaps as HA does: carry the last valid value into missing buckets,
+  // including filling the prefix with the first valid value.
+  size_t first_numeric = count;
+  for (size_t i = 0; i < count; ++i) {
+    if (isfinite(plot_values[i])) {
+      first_numeric = i;
+      break;
+    }
+  }
+  if (!ctx->editable && first_numeric < count) {
+    float last = plot_values[first_numeric];
+    for (size_t i = 0; i < first_numeric; ++i) {
+      plot_values[i] = last;
+    }
+    for (size_t i = first_numeric + 1; i < count; ++i) {
+      if (!isfinite(plot_values[i])) {
+        plot_values[i] = last;
+      } else {
+        last = plot_values[i];
+      }
+    }
+  }
+
+  bool has_range = false;
+  float min_v = 0.0f;
+  float max_v = 0.0f;
+  size_t numeric_count = 0;
+
+  for (float val : plot_values) {
+    if (!isfinite(val)) continue;
+    ++numeric_count;
+    if (!has_range) {
+      min_v = max_v = val;
+      has_range = true;
+    } else {
+      if (val < min_v) min_v = val;
+      if (val > max_v) max_v = val;
+    }
+  }
+
+  set_range_buttons_visible(ctx, ctx->editable || numeric_count > 1);
+
+  int scale = 1;
+  if (has_range) {
+    float span = max_v - min_v;
+    if (span <= 10.0f) {
+      scale = 100;
+    } else if (span <= 100.0f) {
+      scale = 10;
+    }
+    float max_abs = fmaxf(fabsf(min_v), fabsf(max_v));
+    while (scale > 1 && (max_abs * scale) > 30000.0f) {
+      scale /= 10;
+    }
+  }
+
+  keep_chart_history(ctx, plot_values, scale, extract_epoch(doc["range_start"]),
+                     extract_epoch(doc["range_end"]), payload_hours);
+  ctx->point_count = points;
+  lv_chart_set_point_count(ctx->chart, points);
+  int32_t* chart_values = lv_chart_get_series_y_array(ctx->chart, ctx->series);
+  if (!chart_values) {
+    Serial.println("[SensorPopup] History chart buffer unavailable");
+    clear_chart(ctx, points);
+    return;
+  }
+  lv_chart_set_x_start_point(ctx->chart, ctx->series, 0);
+
+  // Write the complete LVGL series buffer in one pass. Calling
+  // lv_chart_set_value_by_id() for every sample invalidates and recalculates
+  // a chart area up to 288 times, blocking the UI for roughly half a second.
+  for (size_t i = 0; i < count; ++i) {
+    float val = plot_values[i];
+    if (!isfinite(val)) {
+      chart_values[i] = LV_CHART_POINT_NONE;
+      continue;
+    }
+    chart_values[i] = static_cast<int32_t>(lroundf(val * scale));
+  }
+
+  // A single sample has no line yet, so make its point visible.
+  if (numeric_count <= 1) {
+    lv_obj_set_style_size(ctx->chart, 8, 8, LV_PART_INDICATOR);
+  } else {
+    lv_obj_set_style_size(ctx->chart, 0, 0, LV_PART_INDICATOR);
+  }
+
+  if (has_range && ctx->chart) {
+    if (min_v == max_v) {
+      min_v -= 1.0f;
+      max_v += 1.0f;
+    }
+    lv_chart_set_range(
+      ctx->chart,
+      LV_CHART_AXIS_PRIMARY_Y,
+      static_cast<lv_coord_t>(floorf(min_v * scale)),
+      static_cast<lv_coord_t>(ceilf(max_v * scale))
+    );
+  }
+  const uint32_t chart_ready_ms = millis();
+
+  // Update Y-axis labels with min/max values: the popup's decimals
+  // (popup_digits) and the unit a step smaller after them (value_unit.h);
+  // sized to their text first, update_y_axis_layout fixes their width.
+  if (has_range) {
+    const char* language = configManager.getConfig().language;
+    for (lv_obj_t* label : {ctx->y_max_label, ctx->y_min_label}) {
+      if (label) lv_obj_set_width(label, LV_SIZE_CONTENT);
+    }
+    if (ctx->y_max_label) {
+      value_unit::show(ctx->y_max_label, i18n::format_number(language, max_v, popup_digits(ctx, max_v)), ctx->unit);
+    }
+    if (ctx->y_min_label) {
+      value_unit::show(ctx->y_min_label, i18n::format_number(language, min_v, popup_digits(ctx, min_v)), ctx->unit);
+    }
+    update_y_axis_layout(ctx);
+  } else {
+    if (ctx->y_max_label) value_unit::show(ctx->y_max_label, "", "");
+    if (ctx->y_min_label) value_unit::show(ctx->y_min_label, "", "");
+    if (ctx->y_zero_label) lv_obj_add_flag(ctx->y_zero_label, LV_OBJ_FLAG_HIDDEN);
+    // No valid range: hide the time axis (and its lines) too.
+    ctx->time_count = 0;
+    for (int i = 0; i < kTimeAxisMarkerCount; ++i) {
+      if (ctx->time_labels[i]) lv_obj_add_flag(ctx->time_labels[i], LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+
+  // One refresh is sufficient after the complete buffer, scale and labels
+  // have been prepared.
+  lv_chart_refresh(ctx->chart);
+  refresh_sensor_readout(ctx);
+
+  const uint32_t apply_finished_ms = millis();
+  const uint32_t total_ms = apply_finished_ms - apply_started_ms;
+  if (total_ms >= 20) {
+    Serial.printf(
+      "[SensorPopup] History applied: points=%u parse=%lu ms chart=%lu ms layout=%lu ms total=%lu ms\n",
+      static_cast<unsigned>(points),
+      static_cast<unsigned long>(parsed_ms - apply_started_ms),
+      static_cast<unsigned long>(chart_ready_ms - parsed_ms),
+      static_cast<unsigned long>(apply_finished_ms - chart_ready_ms),
+      static_cast<unsigned long>(total_ms)
+    );
+  }
+}
+
+static bool should_request_history(const String& entity_id) {
+  return entity_id.length() && !entity_id.startsWith("__") &&
+         !hardwareIo.isLocalEntityId(entity_id.c_str());
+}
+
+static uint32_t editable_history_fingerprint(const String& entity_id) {
+  // Include last_changed, availability and Bridge session/revision so a value
+  // returning to its earlier state while hidden still invalidates the cache.
+  const String payload = haBridgeConfig.findEditableValue(entity_id);
+  uint32_t hash = 2166136261U;
+  for (size_t i = 0; i < payload.length(); ++i) {
+    hash ^= static_cast<uint8_t>(payload.charAt(i));
+    hash *= 16777619U;
+  }
+  return hash;
+}
+
+static void request_history_for_context(SensorPopupContext* ctx) {
+  if (!ctx || !should_request_history(ctx->entity_id)) return;
+  const HistoryRangeConfig cfg = get_history_range_config(
+      ctx->editable ? ctx->editable_requested_range : ctx->history_range);
+  if (ctx->editable) {
+    ctx->history_request_fingerprint = editable_history_fingerprint(ctx->entity_id);
+    ctx->editable_history_id = editable_request_history(ctx->entity_id, cfg.hours);
+    ctx->state_history_refresh_pending = false;
+    ctx->state_history_last_request_ms = millis();
+    return;
+  }
+  if (ctx->state_history_mode) {
+    ctx->state_history_refresh_pending = false;
+    ctx->state_history_last_request_ms = millis();
+    if (ctx->binary_mode) {
+      mqttPublishBinaryHistoryRequest(ctx->entity_id.c_str(), cfg.hours,
+                                      kBinaryMaxSegments);
+    } else {
+      mqttPublishStateHistoryRequest(ctx->entity_id.c_str(), cfg.hours,
+                                     kBinaryMaxSegments);
+    }
+    return;
+  }
+  mqttPublishHistoryRequest(ctx->entity_id.c_str(), cfg.hours, cfg.period_minutes, cfg.points);
+}
+
+// A numeric graph asks for its 24 h history with the popup's first frame:
+// asked after that frame (finish_sensor_popup_open), the graph came a whole
+// frame plus the Bridge's answer late, on the S3 ~80 ms + ~80 ms (user
+// 2026-10-28: the coloured graphs come later than the old ones). Its answer
+// waits in g_pending_history until the body is bound. Editable values and
+// state histories keep the regular request.
+static void request_history_early(const SensorPopupInit& init) {
+  g_sensor_early_history = false;
+  if (init.editable || init.binary_mode || init.state_history_mode || !should_request_history(init.entity_id)) {
+    return;
+  }
+  const HistoryRangeConfig cfg = get_history_range_config(SensorHistoryRange::Day24);
+  // Set first: a stored answer comes back inside the request
+  // (replay_history_response).
+  g_sensor_early_history = true;
+  mqttPublishHistoryRequest(init.entity_id.c_str(), cfg.hours, cfg.period_minutes, cfg.points);
+}
+
+static uint32_t state_history_refresh_interval_ms(
+    const SensorPopupContext* ctx) {
+  return ctx && ctx->history_range == SensorHistoryRange::Day7
+             ? kStateHistoryRefreshMinMs7d
+             : kStateHistoryRefreshMinMs24h;
+}
+
+static void schedule_state_history_refresh(SensorPopupContext* ctx) {
+  if (!ctx || !ctx->state_history_mode) return;
+  const uint32_t now_ms = millis();
+  if (ctx->state_history_last_request_ms == 0 ||
+      static_cast<uint32_t>(now_ms - ctx->state_history_last_request_ms) >=
+          state_history_refresh_interval_ms(ctx)) {
+    request_history_for_context(ctx);
+    return;
+  }
+  ctx->state_history_refresh_pending = true;
+}
+
+static void on_overlay_click(lv_event_t* e) {
+  const ui_theme::SurfaceScope popup_scope = popup_surface::scope();
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  (void)e;
+}
+
+static void set_sensor_popup_visible(SensorPopupContext* ctx, bool visible) {
+  if (!ctx || !ctx->overlay || !ctx->card) return;
+  if (visible) {
+    // LVGL can skip covered grid tiles only when the opaque card participates
+    // in the active screen's cover search, just like the Settings popup.
+    lv_obj_set_parent(ctx->overlay, lv_screen_active());
+    lv_obj_set_pos(ctx->overlay, 0, 0);
+    lv_obj_remove_flag(ctx->card, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(ctx->overlay, LV_OBJ_FLAG_CLICKABLE);
+
+  } else {
+    g_sensor_first_frame.cancel();
+    g_sensor_open_pending = false;
+    g_sensor_early_history = false;
+    g_pending_sensor_init = SensorPopupInit{};
+    hide_popup_shell(ctx->card);
+    cancel_popup_open(ctx->card);
+    lv_obj_add_flag(ctx->card, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(ctx->overlay, LV_OBJ_FLAG_CLICKABLE);
+    // Park the reusable shell off the screen so hidden popups survive screen
+    // replacement; the existing delete callback still owns final cleanup.
+    lv_obj_set_parent(ctx->overlay, lv_layer_top());
+  }
+}
+
+static void on_close_click(lv_event_t* e) {
+  const ui_theme::SurfaceScope popup_scope = popup_surface::scope();
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code != LV_EVENT_CLICKED && code != LV_EVENT_RELEASED) return;
+  SensorPopupContext* ctx = static_cast<SensorPopupContext*>(lv_event_get_user_data(e));
+  if (!ctx || !ctx->overlay || !ctx->card) return;
+  ctx->readout.cancel();
+  editable_control_close(ctx->control);
+  set_sensor_popup_visible(ctx, false);
+}
+
+static void on_overlay_delete(lv_event_t* e) {
+  const ui_theme::SurfaceScope popup_scope = popup_surface::scope();
+  if (lv_event_get_code(e) != LV_EVENT_DELETE) return;
+  SensorPopupContext* ctx = static_cast<SensorPopupContext*>(lv_event_get_user_data(e));
+  if (!ctx) return;
+  // Detach the display refresh hook before the context and its graphs go away.
+  ctx->readout.cancel();
+  heap_caps_free(ctx->history_values);
+  ctx->history_values = nullptr;
+  if (ctx->area_pixels) lv_image_cache_drop(&ctx->area_image);
+  heap_caps_free(ctx->area_pixels);
+  ctx->area_pixels = nullptr;
+  heap_caps_free(ctx->area_tops);
+  ctx->area_tops = nullptr;
+  heap_caps_free(ctx->area_points);
+  ctx->area_points = nullptr;
+  editable_control_delete(ctx->control); ctx->control = nullptr;
+  if (g_sensor_popup_ctx == ctx) {
+    g_sensor_first_frame.cancel();
+    g_sensor_open_pending = false;
+    g_pending_sensor_init = SensorPopupInit{};
+    g_sensor_popup_ctx = nullptr;
+  }
+  delete ctx;
+}
+
+static void on_range_click(lv_event_t* e) {
+  const ui_theme::SurfaceScope popup_scope = popup_surface::scope();
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  SensorPopupContext* ctx = static_cast<SensorPopupContext*>(lv_event_get_user_data(e));
+  lv_obj_t* target = static_cast<lv_obj_t*>(lv_event_get_target(e));
+  if (!ctx || !target) return;
+
+  const SensorHistoryRange next_range = target == ctx->range_week_btn    ? SensorHistoryRange::Day7
+                                        : target == ctx->range_hours_btn ? SensorHistoryRange::Hours6
+                                        : target == ctx->range_hour_btn  ? SensorHistoryRange::Hour1
+                                        : target == ctx->range_month_btn ? SensorHistoryRange::Day30
+                                                                         : SensorHistoryRange::Day24;
+  if (!ctx->editable && ctx->history_range == next_range) return;
+  // A new range starts at its newest point.
+  ctx->readout.cancel();
+  if (ctx->editable) {
+    if (ctx->editable_requested_range == next_range) return;
+    ctx->editable_requested_range = next_range;
+    update_range_buttons(ctx);
+    request_history_for_context(ctx);
+    return;
+  }
+
+  ctx->history_range = next_range;
+  update_range_buttons(ctx);
+  if (ctx->state_history_mode) {
+    clear_binary_history(ctx);
+    if (ctx->editable) clear_chart(ctx, get_history_range_config(ctx->history_range).points);
+  } else {
+    clear_chart(ctx, get_history_range_config(ctx->history_range).points);
+  }
+  request_history_for_context(ctx);
+}
+
+// The graph's picture for the chart's current line, colors and size: the
+// area (below the line `area`, the header circle's color, down to the
+// graph's middle and fading to nothing at its bottom, the card above it),
+// faint lines in `grid` at the maximum and the minimum (`lines`: not for a
+// flat line), at zero (`zero`, a row or -1) and at the time labels, and the
+// line itself in `color`; null without a line (or memory). Computed again
+// only after a change (area_graph::picture_key).
+static const lv_image_dsc_t* graph_picture(SensorPopupContext* ctx, int32_t width, int32_t height, int32_t fade_top,
+                                           int32_t fade_bottom, bool lines, int32_t zero, uint32_t color,
+                                           uint32_t area, uint32_t card, uint32_t grid) {
+  if (width < 2 || height < 2) return nullptr;
+  const int32_t count = static_cast<int32_t>(lv_chart_get_point_count(ctx->chart));
+  if (static_cast<size_t>(width) > ctx->area_tops_capacity) {
+    heap_caps_free(ctx->area_tops);
+    ctx->area_tops = static_cast<int16_t*>(
+        heap_caps_malloc(static_cast<size_t>(width) * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    ctx->area_tops_capacity = ctx->area_tops ? static_cast<size_t>(width) : 0;
+    if (!ctx->area_tops) return nullptr;
+  }
+  if (static_cast<size_t>(count) > ctx->area_points_capacity) {
+    heap_caps_free(ctx->area_points);
+    ctx->area_points = static_cast<area_graph::Point*>(
+        heap_caps_malloc(static_cast<size_t>(count) * sizeof(area_graph::Point), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    ctx->area_points_capacity = ctx->area_points ? static_cast<size_t>(count) : 0;
+    if (!ctx->area_points) return nullptr;
+  }
+  const int32_t points = area_graph::chart_points(ctx->chart, ctx->series, ctx->area_points, count);
+  if (!points) return nullptr;
+  // The time lines' columns: under the time labels' anchors
+  // (update_y_axis_layout), the chart spanning the graph.
+  int32_t time_x[kTimeAxisMarkerCount];
+  const int time_count = std::min<int>(ctx->time_count, kTimeAxisMarkerCount);
+  uint32_t times = static_cast<uint32_t>(time_count);
+  for (int i = 0; i < time_count; ++i) {
+    time_x[i] = static_cast<int32_t>(ctx->time_fracs[i] * width);
+    times = times * 31u + static_cast<uint32_t>(time_x[i]);
+  }
+  const uint32_t key = area_graph::picture_key(
+      ctx->area_points, points,
+      {static_cast<uint32_t>(width), static_cast<uint32_t>(height), static_cast<uint32_t>(fade_top),
+       static_cast<uint32_t>(fade_bottom), lines ? 1u : 0u, static_cast<uint32_t>(zero), times, color, area, card,
+       grid});
+  if (ctx->area_pixels && key == ctx->area_key) return &ctx->area_image;
+  const uint32_t stride = lv_draw_buf_width_to_stride(width, LV_COLOR_FORMAT_RGB565);
+  const size_t bytes = static_cast<size_t>(stride) * static_cast<size_t>(height);
+  if (bytes > ctx->area_capacity) {
+    if (ctx->area_pixels) lv_image_cache_drop(&ctx->area_image);
+    heap_caps_free(ctx->area_pixels);
+    ctx->area_pixels = static_cast<uint16_t*>(heap_caps_aligned_alloc(64, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    ctx->area_capacity = ctx->area_pixels ? bytes : 0;
+    if (!ctx->area_pixels) {
+      Serial.printf("[SensorPopup] Graph picture: %u bytes unavailable\n", static_cast<unsigned>(bytes));
+      return nullptr;
+    }
+  }
+  lv_image_cache_drop(&ctx->area_image);
+  const uint32_t started_us = micros();
+  const uint32_t stride_px = stride / sizeof(uint16_t);
+  area_graph::column_tops(ctx->area_points, points, ctx->area_tops, width);
+  area_graph::render_fade(ctx->area_pixels, stride_px, width, height, ctx->area_tops, (fade_top + fade_bottom) / 2,
+                          fade_bottom, area, card, LV_OPA_COVER);
+  const uint32_t area_us = micros();
+  constexpr int32_t kGridHalf = kGridLineWidth / 2;
+  if (lines) {
+    for (const int32_t row : {fade_top, fade_bottom, zero}) {
+      if (row < 0) continue;
+      area_graph::blend_rect(ctx->area_pixels, stride_px, width, height, 0, row - kGridHalf, width - 1,
+                             row - kGridHalf + kGridLineWidth - 1, grid, kGridLineOpa);
+    }
+  }
+  for (int i = 0; i < time_count; ++i) {
+    area_graph::blend_rect(ctx->area_pixels, stride_px, width, height, time_x[i] - kGridHalf, fade_top,
+                           time_x[i] - kGridHalf + kGridLineWidth - 1, fade_bottom, grid, kGridLineOpa);
+  }
+  const uint32_t grid_us = micros();
+  area_graph::draw_line(ctx->area_pixels, stride_px, width, height, ctx->area_points, points,
+                        static_cast<float>(kChartLineWidth), color);
+  const uint32_t line_us = micros();
+  ctx->area_image.header.magic = LV_IMAGE_HEADER_MAGIC;
+  ctx->area_image.header.cf = LV_COLOR_FORMAT_RGB565;
+  ctx->area_image.header.w = width;
+  ctx->area_image.header.h = height;
+  ctx->area_image.header.stride = stride;
+  ctx->area_image.data = reinterpret_cast<const uint8_t*>(ctx->area_pixels);
+  ctx->area_image.data_size = bytes;
+  ctx->area_key = key;
+  // Computed once per new line, size or color, inside the first frame that
+  // draws it.
+  Serial.printf("[SensorPopup] Graph picture %ldx%ld, %ld points in %lu us (area %lu, grid %lu, line %lu)\n",
+                static_cast<long>(width), static_cast<long>(height), static_cast<long>(points),
+                static_cast<unsigned long>(line_us - started_us), static_cast<unsigned long>(area_us - started_us),
+                static_cast<unsigned long>(grid_us - area_us), static_cast<unsigned long>(line_us - grid_us));
+  return &ctx->area_image;
+}
+
+// The graph (mockups sensor-graph-2 and -3, issue #131) as one picture over
+// the chart's whole box (graph_picture): lv_chart draws no line of its own
+// (line width 0), only a single point when there is just one.
+static void on_chart_area_draw(lv_event_t* event) {
+  const ui_theme::SurfaceScope popup_scope = popup_surface::scope();
+  auto* ctx = static_cast<SensorPopupContext*>(lv_event_get_user_data(event));
+  lv_layer_t* layer = lv_event_get_layer(event);
+  if (!ctx || !layer || !ctx->chart || !ctx->series || !ctx->card) return;
+  const lv_color_t color =
+      ctx->icon_label ? lv_obj_get_style_text_color(ctx->icon_label, LV_PART_MAIN) : lv_color_hex(ui_theme::text());
+  // Set while drawing: lv_chart_set_series_color would invalidate.
+  ctx->series->color = color;
+  uint32_t high = 0, low = 0;
+  const bool lines = chart_extremes(ctx, high, low);
+  lv_area_t coords, content;
+  lv_obj_get_coords(ctx->chart, &coords);
+  lv_obj_get_content_coords(ctx->chart, &content);
+  // The maximum maps to the content's top row, the minimum one row below it
+  // (lv_chart: y_ofs + h).
+  const int32_t fade_top = content.y1 - coords.y1;
+  const int32_t fade_bottom = fade_top + lv_area_get_height(&content);
+  // A line running below zero gets a line at zero too, with its label
+  // (place_zero_label), unless that label would touch the maximum's or the
+  // minimum's (user 2026-10-27).
+  const int32_t zero = graph_zero_row(ctx, fade_top, fade_bottom);
+  const lv_color_t card = lv_obj_get_style_bg_color(ctx->card, LV_PART_MAIN);
+  // The area takes the header circle's color (popup_nav_style::fill, also
+  // the selected range button's), as the tile's area takes its circle's: 40 %
+  // of a light icon color looked far lighter than the circle (user
+  // 2026-10-27).
+  lv_color_t fill;
+  lv_opa_t fill_opa;
+  popup_nav_style::fill(card, color, fill, fill_opa);
+  const lv_color_t area = lv_color_mix(fill, card, fill_opa);
+  if (const lv_image_dsc_t* picture =
+          graph_picture(ctx, lv_area_get_width(&coords), lv_area_get_height(&coords), fade_top, fade_bottom, lines,
+                        zero, lv_color_to_u32(color) & 0xFFFFFF, lv_color_to_u32(area) & 0xFFFFFF,
+                        lv_color_to_u32(card) & 0xFFFFFF, ui_theme::text() & 0xFFFFFF)) {
+    lv_draw_image_dsc_t image;
+    lv_draw_image_dsc_init(&image);
+    image.base.layer = layer;
+    image.src = picture;
+    lv_draw_image(layer, &image, &coords);
+    // The picture is the whole graph. lv_chart's own pass only walked the
+    // points (line width 0), and with more points than columns its crowded
+    // mode writes three points past its buffer (lv_chart.c: w + 1 columns
+    // into w * 3 points); 720 points broke the heap (emulator 2026-10-29).
+    lv_event_stop_processing(event);
+  }
+}
+
+static void build_popup_shell(SensorPopupContext* ctx, const SensorPopupInit& init) {
+  const auto parts = create_popup_body(on_close_click, ctx, init.bg_color ? init.bg_color : ui_theme::popup_card());
+  ctx->overlay = parts.overlay;
+  ctx->card = parts.card;
+  ctx->title_label = parts.title;
+  ctx->icon_label = parts.icon;
+  ctx->close_button = parts.close;
+  lv_obj_t* overlay = parts.overlay;
+  hometiles_title::set(parts.title, init.title.c_str());
+  // The shared header shows the current value from this hidden label. It is
+  // never drawn, so live value updates repaint only the header line.
+  ctx->value_label = lv_label_create(parts.card);
+  ctx->value_unit_label = nullptr;  // value_unit::show adds it as the holder's child
+  lv_label_set_text(ctx->value_label, "");
+  lv_obj_add_flag(ctx->value_label, LV_OBJ_FLAG_HIDDEN);
+
+  lv_obj_add_event_cb(overlay, on_overlay_click, LV_EVENT_CLICKED, ctx);
+  lv_obj_add_event_cb(overlay, on_overlay_delete, LV_EVENT_DELETE, ctx);
+}
+
+static void build_popup_body(SensorPopupContext* ctx) {
+  if (ctx->body_box) return;
+  lv_obj_t* card = ctx->card;
+
+  lv_obj_t* range_row = lv_obj_create(card);
+  ctx->range_row = range_row;
+  lv_obj_remove_style_all(range_row);
+  lv_obj_set_size(range_row, (kRangeButtonWidth * 5) + kRangeButtonGap * 4, popup_layout::kNavHeight);
+  lv_obj_align(range_row, LV_ALIGN_BOTTOM_MID, 0, -popup_layout::kNavBottomInset);
+  lv_obj_set_style_bg_opa(range_row, LV_OPA_TRANSP, 0);
+  lv_obj_set_layout(range_row, LV_LAYOUT_FLEX);
+  lv_obj_set_flex_flow(range_row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(range_row, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(range_row, kRangeButtonGap, 0);
+  lv_obj_clear_flag(range_row, LV_OBJ_FLAG_CLICKABLE);
+
+  auto make_range_button = [&](const char* text) -> lv_obj_t* {
+    lv_obj_t* btn = lv_button_create(range_row);
+    lv_obj_set_size(btn, kRangeButtonWidth, kRangeButtonHeight);
+    lv_obj_set_style_radius(btn, kRangeButtonHeight / 2, 0);
+    lv_obj_set_style_pad_all(btn, 0, 0);
+    lv_obj_set_style_anim_time(btn, 0, 0);
+    lv_obj_set_style_anim_time(btn, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_shadow_opa(btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_shadow_opa(btn, LV_OPA_TRANSP, LV_STATE_PRESSED);
+    lv_obj_set_style_transform_width(btn, 0, 0);
+    lv_obj_set_style_transform_width(btn, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_transform_height(btn, 0, 0);
+    lv_obj_set_style_transform_height(btn, 0, LV_STATE_PRESSED);
+    lv_obj_set_style_translate_y(btn, 0, 0);
+    lv_obj_set_style_translate_y(btn, 0, LV_STATE_PRESSED);
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_PRESS_LOCK);
+    lv_obj_t* label = lv_label_create(btn);
+    set_label_style(label, lv_color_hex(ui_theme::text()), popup_layout::font24());
+    lv_label_set_text(label, text);
+    lv_obj_center(label);
+    return btn;
+  };
+
+  // 7D sits left of 24H and 6H right of it: the longer range reaches further
+  // into the past.
+  ctx->range_month_btn = make_range_button("30D");
+  ctx->range_week_btn = make_range_button("7D");
+  ctx->range_day_btn = make_range_button("24H");
+  ctx->range_hours_btn = make_range_button("6H");
+  ctx->range_hour_btn = make_range_button("1H");
+  for (lv_obj_t* btn : {ctx->range_month_btn, ctx->range_week_btn, ctx->range_day_btn, ctx->range_hours_btn,
+                        ctx->range_hour_btn}) {
+    lv_obj_add_event_cb(btn, on_range_click, LV_EVENT_CLICKED, ctx);
+  }
+  update_range_buttons(ctx);
+  set_range_buttons_visible(ctx, false);
+
+  lv_obj_t* value_box = lv_obj_create(card);
+  ctx->value_box = value_box;
+  lv_obj_remove_style_all(value_box);
+  lv_obj_set_size(value_box, LV_PCT(100), popup_layout::kValueHeight);
+  lv_obj_align(
+      value_box, LV_ALIGN_TOP_MID, 0,
+      popup_layout::kValueY - kContentLiftY);
+  lv_obj_set_style_bg_opa(value_box, LV_OPA_TRANSP, 0);
+  lv_obj_clear_flag(value_box, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(value_box, LV_OBJ_FLAG_SCROLLABLE);
+  // The value moved into the shared header; this row is the graph readout.
+  build_readout_band(ctx);
+
+  ctx->control_row = lv_obj_create(card);
+  lv_obj_remove_style_all(ctx->control_row);
+  lv_obj_set_size(ctx->control_row, LV_PCT(100), popup_layout::kValueHeight);
+  lv_obj_align(ctx->control_row, LV_ALIGN_TOP_MID, 0, popup_layout::kValueY);
+  lv_obj_remove_flag(ctx->control_row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(ctx->control_row, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+  ctx->control = editable_control_create(ctx->control_row, card, ctx->icon_label);
+
+  lv_obj_t* body_box = lv_obj_create(card);
+  ctx->body_box = body_box;
+  lv_obj_remove_style_all(body_box);
+  lv_obj_set_size(body_box, LV_PCT(100), popup_layout::kBodyHeight);
+  lv_obj_align(
+      body_box, LV_ALIGN_TOP_MID, 0,
+      popup_layout::kBodyY - kContentLiftY);
+  lv_obj_set_style_bg_opa(body_box, LV_OPA_TRANSP, 0);
+  lv_obj_add_flag(body_box, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+  lv_obj_clear_flag(body_box, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(body_box, LV_OBJ_FLAG_SCROLLABLE);
+
+  // Chart wrapper: Y-axis labels on the left, chart on the right, time labels below.
+  // Extra vertical space (kLabelOverhang) at top/bottom so labels don't get clipped.
+  constexpr int kLabelOverhang = popup_layout::contentScale(12);
+  lv_obj_t* chart_wrap = lv_obj_create(body_box);
+  ctx->chart_wrap = chart_wrap;
+  lv_obj_remove_style_all(chart_wrap);
+  lv_obj_set_size(chart_wrap, LV_PCT(100), kChartHeight + kTimeLabelExtra + 2 * kLabelOverhang + kTimeAxisHeight);
+  lv_obj_center(chart_wrap);
+  lv_obj_set_style_bg_opa(chart_wrap, LV_OPA_TRANSP, 0);
+  lv_obj_add_flag(chart_wrap, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+  lv_obj_remove_flag(chart_wrap, LV_OBJ_FLAG_SCROLLABLE);
+
+  // Layout: [labels] [chart fills rest]
+  constexpr int kYAxisWidth = popup_layout::scale(48);
+  const int kChartLeft = kYAxisWidth;
+  const lv_font_t* y_font = popup_layout::font20();
+
+  // Max label: vertically centered on top guide line (at y = kLabelOverhang)
+  lv_obj_t* y_max = lv_label_create(chart_wrap);
+  ctx->y_max_label = y_max;
+  set_label_style(y_max, lv_color_hex(ui_theme::text()), y_font);
+  // Right-aligned in the labels' common width (update_y_axis_layout): the
+  // widest at the card's content edge like the header circle (mockup
+  // sensor-graph-2), the units in one column at the graph.
+  lv_obj_set_style_text_align(y_max, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_obj_set_width(y_max, kYAxisWidth - 10);
+  lv_label_set_text(y_max, "");
+  lv_obj_set_pos(y_max, kGraphInset, 0);  // font center ~kLabelOverhang = on top guide line
+
+  // Min label: vertically centered on bottom guide line (at y = kLabelOverhang + kChartHeight - 1)
+  lv_obj_t* y_min = lv_label_create(chart_wrap);
+  ctx->y_min_label = y_min;
+  set_label_style(y_min, lv_color_hex(ui_theme::text()), y_font);
+  lv_obj_set_style_text_align(y_min, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_obj_set_width(y_min, kYAxisWidth - 10);
+  lv_label_set_text(y_min, "");
+  lv_obj_set_pos(y_min, kGraphInset, kChartHeight);  // font center ~kChartHeight+kLabelOverhang = on bottom guide line
+
+  // Zero label: on the zero line while the line crosses it (place_zero_label).
+  lv_obj_t* y_zero = lv_label_create(chart_wrap);
+  ctx->y_zero_label = y_zero;
+  set_label_style(y_zero, lv_color_hex(ui_theme::text()), y_font);
+  lv_obj_set_style_text_align(y_zero, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_label_set_text(y_zero, "");
+  lv_obj_add_flag(y_zero, LV_OBJ_FLAG_HIDDEN);
+
+  // Time labels below the graph, positioned by update_y_axis_layout.
+  for (int i = 0; i < kTimeAxisMarkerCount; ++i) {
+    lv_obj_t* tlbl = lv_label_create(chart_wrap);
+    set_label_style(tlbl, lv_color_hex(ui_theme::text()), popup_layout::font20());
+    lv_obj_set_style_text_align(tlbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(tlbl, LV_SIZE_CONTENT);
+    lv_label_set_text(tlbl, "");
+    lv_obj_set_pos(tlbl, 0, kLabelOverhang + kChartHeight + kTimeLabelGap);
+    lv_obj_add_flag(tlbl, LV_OBJ_FLAG_HIDDEN);
+    ctx->time_labels[i] = tlbl;
+  }
+
+  // The chart spans exactly the graph (update_y_axis_layout moves its left
+  // edge after the labels); kChartLinePad above and below keeps the line's
+  // width at the maximum and the minimum inside it, so its content rows
+  // stay the graph's rows between the label centers.
+  lv_obj_t* chart = lv_chart_create(chart_wrap);
+  ctx->chart = chart;
+  lv_obj_set_size(chart, kCardWidth - (kCardPad * 2) - 2 * kGraphInset - kChartLeft, kChartHeight + 2 * kChartLinePad);
+  lv_obj_set_style_bg_opa(chart, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(chart, 0, 0);
+  lv_obj_set_style_pad_hor(chart, 0, 0);
+  lv_obj_set_style_pad_ver(chart, kChartLinePad, 0);
+  lv_obj_set_pos(chart, kGraphInset + kChartLeft, kLabelOverhang - kChartLinePad);
+  lv_chart_set_div_line_count(chart, 0, 0);
+  lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
+  lv_chart_set_update_mode(chart, LV_CHART_UPDATE_MODE_SHIFT);
+  // The line is part of the graph's picture (on_chart_area_draw).
+  lv_obj_set_style_line_width(chart, 0, LV_PART_ITEMS);
+  lv_obj_set_style_size(chart, 0, 0, LV_PART_INDICATOR);
+
+  ctx->series = lv_chart_add_series(chart, lv_color_hex(ui_theme::icon()), LV_CHART_AXIS_PRIMARY_Y);
+  lv_obj_add_event_cb(chart, on_chart_area_draw,
+                      static_cast<lv_event_code_t>(LV_EVENT_DRAW_MAIN | LV_EVENT_PREPROCESS), ctx);
+  clear_chart(ctx, get_history_range_config(ctx->history_range).points);
+
+  lv_obj_move_foreground(ctx->icon_label);
+  lv_obj_move_foreground(ctx->title_label);
+  // Above the editor row, which the readout covers while a finger is on a graph.
+  lv_obj_move_foreground(value_box);
+  lv_obj_move_foreground(range_row);
+  lv_obj_move_foreground(ctx->close_button);
+  attach_chart_readout(ctx);
+}
+
+}  // namespace
+
+void sensor_popup_prefetch_history(const String& entity_id) {
+  if (!should_request_history(entity_id)) return;
+  const HistoryRangeConfig cfg = get_history_range_config(SensorHistoryRange::Day24);
+  mqttPrefetchHistoryRequest(entity_id.c_str(), cfg.hours, cfg.period_minutes, cfg.points);
+}
+
+bool sensor_popup_should_use_state_history(const String& value,
+                                           const String& unit) {
+  String normalized_unit = unit;
+  normalized_unit.trim();
+  if (normalized_unit.length()) return false;
+
+  String normalized_value = value;
+  normalized_value.trim();
+  if (!normalized_value.length()) return false;
+  String lower = normalized_value;
+  lower.toLowerCase();
+  if (lower == "unknown" || lower == "unavailable" || lower == "none" ||
+      lower == "null") {
+    return false;
+  }
+
+  char* end = nullptr;
+  const float parsed = strtof(normalized_value.c_str(), &end);
+  const bool numeric = end && end != normalized_value.c_str() &&
+                       *end == '\0' && isfinite(parsed);
+  return !numeric;
+}
+
+static bool reusable_sensor_body(const SensorPopupContext* ctx, const SensorPopupInit& init) {
+  if (!ctx || !ctx->body_box || lv_obj_has_flag(ctx->body_box, LV_OBJ_FLAG_HIDDEN) ||
+      ctx->entity_id != init.entity_id || ctx->editable != init.editable ||
+      ctx->binary_mode != init.binary_mode ||
+      ctx->state_history_mode != (init.editable || init.binary_mode || init.state_history_mode) ||
+      ctx->history_range != SensorHistoryRange::Day24 ||
+      ctx->history_language != configManager.getConfig().language ||
+      ctx->decimals != init.decimals || ctx->history_unit != init.unit) return false;
+  return !init.editable || (ctx->history_loaded &&
+      ctx->history_kind == parse_editable_value(haBridgeConfig.findEditableValue(init.entity_id)).kind);
+}
+
+static void finish_sensor_popup_open() {
+  if (g_sensor_popup_ctx && popup_open_pending(g_sensor_popup_ctx->card)) return;
+  if (!g_sensor_open_pending || g_sensor_first_frame.pending() ||
+      !g_sensor_popup_ctx || !is_popup_visible(g_sensor_popup_ctx)) return;
+  SensorPopupInit init = std::move(g_pending_sensor_init);
+  g_sensor_open_pending = false;
+  g_pending_sensor_init = SensorPopupInit{};
+  build_popup_body(g_sensor_popup_ctx);
+
+  // Retain the last rendered history while its refresh is requested. There is
+  // still only one resident body, shared by all Sensor entities and modes.
+  const auto* previous = g_sensor_popup_ctx;
+  const bool reuse_history = reusable_sensor_body(previous, init);
+  const bool fresh_history = reuse_history && init.editable && !previous->state_history_refresh_pending &&
+      previous->history_fingerprint == editable_history_fingerprint(init.entity_id) &&
+      static_cast<uint32_t>(millis() - previous->history_loaded_ms) < kStateHistoryRefreshMinMs24h;
+  if (g_sensor_popup_ctx && g_sensor_popup_ctx->overlay && g_sensor_popup_ctx->card) {
+    apply_init_to_context(g_sensor_popup_ctx, init, reuse_history, false);
+    g_sensor_popup_ctx->history_range = SensorHistoryRange::Day24;
+    update_range_buttons(g_sensor_popup_ctx);
+    if (!reuse_history && g_sensor_popup_ctx->state_history_mode) {
+      g_sensor_popup_ctx->history_loaded = false;
+      clear_binary_history(g_sensor_popup_ctx);
+      if (g_sensor_popup_ctx->editable && g_sensor_popup_ctx->editable_kind == "number")
+        clear_chart(g_sensor_popup_ctx, get_history_range_config(g_sensor_popup_ctx->history_range).points);
+    } else if (!reuse_history) {
+      g_sensor_popup_ctx->history_loaded = false;
+      clear_chart(g_sensor_popup_ctx,
+                  get_history_range_config(
+                      g_sensor_popup_ctx->history_range).points);
+    }
+  }
+  lv_obj_remove_flag(g_sensor_popup_ctx->body_box, LV_OBJ_FLAG_HIDDEN);
+  set_range_buttons_visible(g_sensor_popup_ctx,
+                            g_sensor_popup_ctx->state_history_mode);
+  g_sensor_popup_ctx->state_history_refresh_pending = false;
+  g_sensor_popup_ctx->readout_refresh_pending = reuse_history;
+  // The early request's answer, when it is already here, goes into the
+  // controls' frame: applied in the pass after it, the graph came one frame
+  // later than the popup (user 2026-10-28, b609).
+  if (g_sensor_early_history && g_pending_history.valid &&
+      (!g_pending_history.entity_id.length() ||
+       g_sensor_popup_ctx->entity_id.equalsIgnoreCase(g_pending_history.entity_id))) {
+    apply_history_payload(g_sensor_popup_ctx, g_pending_history.payload.c_str());
+    g_pending_history.valid = false;
+  }
+  // Present the controls before applying a returned history in another pass.
+  g_sensor_first_frame.begin();
+  if (!fresh_history && !g_sensor_early_history) request_history_for_context(g_sensor_popup_ctx);
+  g_sensor_early_history = false;
+}
+
+void show_sensor_popup(const SensorPopupInit& init) {
+  const ui_theme::SurfaceScope popup_scope = popup_surface::scope();
+  hide_pin_popup();
+  hide_camera_popup();
+  hide_climate_popup();
+  hide_cover_popup();
+  if (!init.entity_id.length()) return;
+  hide_light_popup();
+  hide_weather_popup();
+  hide_energy_popup();
+  hide_media_popup();
+  hide_device_popup();
+  hide_vacuum_popup();
+  hide_calendar_popup();
+
+  if (!g_sensor_popup_ctx) {
+    g_sensor_popup_ctx = new SensorPopupContext();
+    build_popup_shell(g_sensor_popup_ctx, init);
+  }
+  auto* ctx = g_sensor_popup_ctx;
+  ctx->readout.cancel();
+  editable_control_close(ctx->control);
+  // A matching resident body is part of the first frame. Only a different
+  // entity or layout needs the header while its content is being rebound.
+  const bool kept_body = reusable_sensor_body(ctx, init);
+  if (!kept_body) {
+    for (auto* body : {ctx->body_box, ctx->control_row, ctx->value_box, ctx->range_row}) {
+      if (body) lv_obj_add_flag(body, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+  g_pending_sensor_init = init;
+  g_sensor_open_pending = true;
+  g_pending_history.valid = false;
+  g_pending_binary_state.valid = false;
+  apply_sensor_header(ctx, init);
+  apply_sensor_header_value(ctx, init);
+  defer_popup_content(g_sensor_popup_ctx->card, finish_sensor_popup_open);
+  set_sensor_popup_visible(ctx, true);
+  // Once visible: a stored answer comes back inside the request and is only
+  // kept for a visible popup (queue_sensor_popup_history).
+  request_history_early(init);
+  lv_obj_invalidate(ctx->card);
+  if (g_sensor_popup_ctx && g_sensor_popup_ctx->card) viewNavigationPopupShown(g_sensor_popup_ctx->card, init.entity_id.c_str());
+  show_popup_shell(g_sensor_popup_ctx->overlay, g_sensor_popup_ctx->card, g_sensor_popup_ctx->title_label, g_sensor_popup_ctx->icon_label, g_sensor_popup_ctx->close_button,
+                   nullptr, g_sensor_popup_ctx->value_label);
+  // The kept body shows in the first frame: its range buttons and editor
+  // take this tile's card color now, after the shell (they follow its disc),
+  // not only when the icon's color changed (user 2026-10-28).
+  if (kept_body) {
+    update_range_buttons(ctx);
+    editable_control_follow_colors(ctx->control);
+  }
+}
+
+void preload_sensor_popup() {
+  const ui_theme::SurfaceScope popup_scope = popup_surface::theme_scope();
+  if (g_sensor_popup_ctx && g_sensor_popup_ctx->overlay && g_sensor_popup_ctx->card) return;
+  SensorPopupInit init;
+  init.entity_id = "__preload__";
+  init.title = "";
+  init.icon_name = "";
+  init.value = "";
+  init.unit = "";
+  init.decimals = 0xFF;
+  g_sensor_popup_ctx = new SensorPopupContext();
+  build_popup_shell(g_sensor_popup_ctx, init);
+  build_popup_body(g_sensor_popup_ctx);
+  apply_init_to_context(g_sensor_popup_ctx, init);
+  if (g_sensor_popup_ctx && g_sensor_popup_ctx->card && g_sensor_popup_ctx->overlay) {
+    set_sensor_popup_visible(g_sensor_popup_ctx, false);
+  }
+}
+
+void hide_sensor_popup() {
+  g_sensor_first_frame.cancel();
+  g_sensor_open_pending = false;
+  g_sensor_early_history = false;
+  g_pending_sensor_init = SensorPopupInit{};
+  if (g_sensor_popup_ctx) {
+    g_sensor_popup_ctx->readout.cancel();
+    editable_control_close(g_sensor_popup_ctx->control);
+  }
+  if (!g_sensor_popup_ctx || !g_sensor_popup_ctx->card || !g_sensor_popup_ctx->overlay) return;
+  set_sensor_popup_visible(g_sensor_popup_ctx, false);
+}
+
+void queue_sensor_popup_value(const char* entity_id, const char* value, const char* unit, uint8_t decimals) {
+  if (!entity_id || !*entity_id || !value) return;
+  g_pending_value.entity_id = entity_id;
+  g_pending_value.value = value;
+  g_pending_value.unit = unit ? unit : "";
+  g_pending_value.decimals = decimals;
+  g_pending_value.valid = true;
+}
+
+static String extract_history_entity_id(const String& payload) {
+  int key = payload.indexOf("\"entity_id\"");
+  if (key < 0) return "";
+  int colon = payload.indexOf(':', key);
+  if (colon < 0) return "";
+  int q1 = payload.indexOf('"', colon + 1);
+  if (q1 < 0) return "";
+  int q2 = payload.indexOf('"', q1 + 1);
+  if (q2 < 0) return "";
+  String entity = payload.substring(q1 + 1, q2);
+  entity.trim();
+  return entity;
+}
+
+void queue_sensor_popup_icon_refresh() { g_pending_icon_refresh = true; }
+
+void queue_sensor_popup_history(const char* entity_id, const char* payload, size_t len) {
+  if (!payload || len == 0) return;
+  // While the popup opens only the early request's answer is kept (for the
+  // entity it opens with); it is applied once the body is bound.
+  if (g_sensor_open_pending && !g_sensor_early_history) return;
+  if (!g_sensor_popup_ctx || !is_popup_visible(g_sensor_popup_ctx)) return;
+
+  String payload_text = String(payload).substring(0, len);
+  String incoming_entity = entity_id ? entity_id : "";
+  incoming_entity.trim();
+  if (!incoming_entity.length()) {
+    incoming_entity = extract_history_entity_id(payload_text);
+  }
+
+  // Ignore history updates for other entities while this popup is open.
+  const String& shown_entity = g_sensor_open_pending ? g_pending_sensor_init.entity_id : g_sensor_popup_ctx->entity_id;
+  if (incoming_entity.length() && !shown_entity.equalsIgnoreCase(incoming_entity)) {
+    return;
+  }
+
+  g_pending_history.entity_id = incoming_entity;
+  g_pending_history.payload.assign(payload_text.c_str(), payload_text.length());
+  g_pending_history.valid = true;
+}
+
+void queue_sensor_popup_binary_state(const String& entity_id,
+                                     const String& state,
+                                     bool available,
+                                     const String& device_class,
+                                     uint64_t last_changed,
+                                     const String& icon_name) {
+  if (!entity_id.length()) return;
+  g_pending_binary_state.entity_id = entity_id;
+  g_pending_binary_state.state = state;
+  g_pending_binary_state.available = available;
+  g_pending_binary_state.device_class = device_class;
+  g_pending_binary_state.last_changed = last_changed;
+  g_pending_binary_state.icon_name = icon_name;
+  g_pending_binary_state.valid = true;
+}
+
+void process_sensor_popup_queue() {
+  const ui_theme::SurfaceScope popup_scope = popup_surface::scope();
+  if (!g_sensor_popup_ctx || !g_sensor_popup_ctx->card) {
+    g_pending_value.valid = false;
+    g_pending_history.valid = false;
+    g_pending_binary_state.valid = false;
+    return;
+  }
+
+  if (g_sensor_open_pending) {
+    finish_sensor_popup_open();
+    return;
+  }
+  if (g_sensor_first_frame.pending()) return;
+  if (g_sensor_popup_ctx->readout_refresh_pending) {
+    g_sensor_popup_ctx->readout_refresh_pending = false;
+    refresh_sensor_readout(g_sensor_popup_ctx);
+  }
+
+  if (g_pending_icon_refresh) {
+    g_pending_icon_refresh = false;
+    if (is_popup_visible(g_sensor_popup_ctx)) refresh_editable_popup_icon(g_sensor_popup_ctx);
+  }
+  if (g_sensor_popup_ctx->editable && is_popup_visible(g_sensor_popup_ctx)) {
+    auto* ctx = g_sensor_popup_ctx;
+    editable_control_refresh(ctx->control);
+    if (ctx->editable_generation != editable_value_generation()) {
+    ctx->editable_generation = editable_value_generation();
+    const EditableValue value = parse_editable_value(haBridgeConfig.findEditableValue(ctx->entity_id));
+    show_header_value(ctx, editable_display_number(value), editable_display_unit(value));
+    apply_editable_icon_color(ctx, value);
+    ctx->value_fraction_digits = numeric_fraction_digits(value.state);
+    if (value.valid && (ctx->editable_state != value.state || ctx->editable_kind != value.kind || ctx->editable_available != value.available)) {
+      const bool kind_changed = ctx->editable_kind != value.kind;
+      ctx->editable_state = value.state; ctx->editable_kind = value.kind;
+      ctx->editable_available = value.available;
+      if (value.last_changed) prepend_state_history_activity(ctx, value.last_changed, 2, value.available ? value.state : String("unavailable"));
+      ctx->unit = value.unit;
+      if (kind_changed) { layout_editable_history(ctx); request_history_for_context(ctx); }
+      else schedule_state_history_refresh(ctx);
+    }
+    }
+  }
+
+  if (g_pending_binary_state.valid) {
+    if (g_sensor_popup_ctx->binary_mode &&
+        g_sensor_popup_ctx->entity_id.equalsIgnoreCase(
+            g_pending_binary_state.entity_id) &&
+        is_popup_visible(g_sensor_popup_ctx)) {
+      const String previous_state = g_sensor_popup_ctx->binary_state;
+      const bool previous_available = g_sensor_popup_ctx->binary_available;
+      update_binary_state(g_sensor_popup_ctx, g_pending_binary_state.state,
+                          g_pending_binary_state.available,
+                          g_pending_binary_state.device_class,
+                          g_pending_binary_state.last_changed,
+                          g_pending_binary_state.icon_name);
+      if (previous_state != g_sensor_popup_ctx->binary_state ||
+          previous_available != g_sensor_popup_ctx->binary_available) {
+        prepend_state_history_activity(
+            g_sensor_popup_ctx,
+            g_sensor_popup_ctx->binary_last_changed,
+            binary_state_code(g_sensor_popup_ctx->binary_state,
+                              g_sensor_popup_ctx->binary_available),
+            g_sensor_popup_ctx->binary_state);
+        schedule_state_history_refresh(g_sensor_popup_ctx);
+      }
+    }
+    g_pending_binary_state.valid = false;
+  }
+
+  if (g_pending_value.valid) {
+    if (!g_sensor_popup_ctx->editable && !g_sensor_popup_ctx->binary_mode &&
+        g_sensor_popup_ctx->entity_id.equalsIgnoreCase(g_pending_value.entity_id) &&
+        is_popup_visible(g_sensor_popup_ctx)) {
+      const String previous_value = g_sensor_popup_ctx->state_history_value;
+      String live_unit = g_sensor_popup_ctx->lock_unit ? g_sensor_popup_ctx->unit : g_pending_value.unit;
+      update_value_label(g_sensor_popup_ctx, g_pending_value.value, live_unit);
+      if (g_sensor_popup_ctx->state_history_mode) {
+        const String next_value =
+            normalize_state_live_value(g_pending_value.value);
+        g_sensor_popup_ctx->state_history_value = next_value;
+        if (next_value != previous_value) {
+          prepend_state_history_activity(
+              g_sensor_popup_ctx, static_cast<uint64_t>(time(nullptr)), 2,
+              next_value);
+          schedule_state_history_refresh(g_sensor_popup_ctx);
+        }
+      }
+    }
+    g_pending_value.valid = false;
+  }
+
+  // History waits while a finger reads the graph, so only the cursor changes.
+  if (g_pending_history.valid && !g_sensor_first_frame.pending() &&
+      !editable_control_is_interacting(g_sensor_popup_ctx->control) &&
+      !g_sensor_popup_ctx->readout.active()) {
+    bool same_entity = true;
+    if (g_pending_history.entity_id.length()) {
+      same_entity = g_sensor_popup_ctx->entity_id.equalsIgnoreCase(g_pending_history.entity_id);
+    }
+    if (same_entity && is_popup_visible(g_sensor_popup_ctx)) {
+      apply_history_payload(g_sensor_popup_ctx, g_pending_history.payload.c_str());
+    }
+    g_pending_history.valid = false;
+  }
+
+  if (g_sensor_popup_ctx->state_history_mode &&
+      g_sensor_popup_ctx->state_history_refresh_pending &&
+      is_popup_visible(g_sensor_popup_ctx) &&
+      static_cast<uint32_t>(millis() -
+                            g_sensor_popup_ctx->state_history_last_request_ms) >=
+          state_history_refresh_interval_ms(g_sensor_popup_ctx)) {
+    request_history_for_context(g_sensor_popup_ctx);
+  }
+}

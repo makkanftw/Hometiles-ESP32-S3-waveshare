@@ -1,0 +1,227 @@
+#include "src/ui/shared/ui_surface_style.h"
+#include "src/types/navigate/renderer.h"
+#include "src/tiles/runtime/tile_renderer_shared.h"
+#include "src/ui/shared/tone_color.h"
+#include "src/tiles/runtime/tile_renderer_fonts.h"
+#include "src/tiles/runtime/tile_icon_disc.h"
+#include "src/tiles/runtime/compact_sensor_layout.h"
+#include "src/tiles/runtime/tile_icon_source.h"
+#include "src/tiles/icons/mdi_icons.h"
+#include "src/tiles/config/tile_config.h"
+#include "src/ui/ui_manager.h"
+#include "src/ui/shared/icon_lock_mark.h"
+#include "src/core/config/config_manager.h"
+#include <Arduino.h>
+#include "src/ui/shared/ui_theme.h"
+
+struct NavigateEventData {
+  uint8_t target_kind;
+  uint16_t target_folder_id;
+  String title;
+  String icon_name;
+  uint32_t bg_color;
+};
+
+static uint16_t navFolderIdFromTile(const Tile& tile) {
+  return static_cast<uint16_t>((static_cast<uint16_t>(tile.key_modifier) << 8) | tile.key_code);
+}
+
+// A PIN-protected Folder or Settings tile shows a lock in its icon
+// (icon_lock_mark.h, user 2026-10-02); the rim takes the icon's disc over the
+// tile card. Half-height icons sit inside their disc, taller ones above it.
+static void lock_mark_event_cb(lv_event_t* event) {
+  lv_obj_t* icon = static_cast<lv_obj_t*>(lv_event_get_current_target(event));
+  if (lv_event_get_code(event) == LV_EVENT_REFR_EXT_DRAW_SIZE) {
+    icon_lock_mark::ext_draw_size(event, icon);
+    return;
+  }
+  if (lv_event_get_code(event) != LV_EVENT_DRAW_POST) return;
+  lv_obj_t* disc = tile_icon_disc::disc_of(icon);
+  lv_obj_t* card = lv_obj_get_parent(disc ? disc : icon);
+  const lv_color_t under = card ? lv_obj_get_style_bg_color(card, LV_PART_MAIN) : lv_color_hex(ui_theme::screen());
+  icon_lock_mark::draw(lv_event_get_layer(event), icon, icon_lock_mark::behind(disc, under));
+}
+
+static bool navigate_tile_locked(const Tile& tile) {
+  if (tile.type == TILE_SETTINGS) return configManager.getConfig().settings_pin_enabled;
+  return tile.type == TILE_FOLDER && tileConfig.isFolderPinEnabled(navFolderIdFromTile(tile));
+}
+
+lv_obj_t* render_navigate_tile(lv_obj_t* parent, int col, int row, const Tile& tile, uint8_t index) {
+  lv_obj_t* btn = lv_button_create(parent);
+  ui_surface_style::apply_radius(btn, tile_layout::scale_480(22), 0);
+  lv_obj_set_style_border_width(btn, 0, 0);
+
+  // Without an explicit color, all navigation types use the global default
+  // tile color like the other HomeTiles tiles.
+  uint32_t btn_color = tileBgColorOrDefault(tile, tileDefaultBgColor());
+  lv_obj_set_style_bg_color(btn, lv_color_hex(btn_color), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(btn_color), LV_PART_MAIN | LV_STATE_FOCUSED);
+  lv_obj_set_style_bg_grad_color(btn, lv_color_hex(btn_color), LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_bg_grad_color(btn, lv_color_hex(btn_color), LV_PART_MAIN | LV_STATE_FOCUSED);
+  lv_obj_set_style_bg_grad_dir(btn, LV_GRAD_DIR_NONE, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_bg_grad_dir(btn, LV_GRAD_DIR_NONE, LV_PART_MAIN | LV_STATE_FOCUSED);
+
+  // Pressed state: 10% brighter.
+  uint32_t pressed_color = tone_color::pressed_card(btn_color);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(pressed_color), LV_PART_MAIN | LV_STATE_PRESSED);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(pressed_color), LV_PART_MAIN | (LV_STATE_FOCUSED | LV_STATE_PRESSED));
+  lv_obj_set_style_bg_grad_color(btn, lv_color_hex(pressed_color), LV_PART_MAIN | LV_STATE_PRESSED);
+  lv_obj_set_style_bg_grad_color(btn, lv_color_hex(pressed_color), LV_PART_MAIN | (LV_STATE_FOCUSED | LV_STATE_PRESSED));
+  lv_obj_set_style_bg_grad_dir(btn, LV_GRAD_DIR_NONE, LV_PART_MAIN | LV_STATE_PRESSED);
+  lv_obj_set_style_bg_grad_dir(btn, LV_GRAD_DIR_NONE, LV_PART_MAIN | (LV_STATE_FOCUSED | LV_STATE_PRESSED));
+  lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+  lv_obj_set_style_outline_width(btn, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_outline_width(btn, 0, LV_PART_MAIN | LV_STATE_FOCUSED);
+  lv_obj_set_style_outline_width(btn, 0, LV_PART_MAIN | LV_STATE_PRESSED);
+  lv_obj_set_style_outline_width(btn, 0, LV_PART_MAIN | (LV_STATE_FOCUSED | LV_STATE_PRESSED));
+  lv_obj_set_style_outline_opa(btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
+  lv_obj_set_style_outline_opa(btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
+  lv_obj_set_style_outline_opa(btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_PRESSED);
+  lv_obj_set_style_outline_opa(btn, LV_OPA_TRANSP, LV_PART_MAIN | (LV_STATE_FOCUSED | LV_STATE_PRESSED));
+  lv_obj_set_style_shadow_width(btn, 0, 0);
+  lv_obj_remove_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+  disable_pressed_button_animation(btn);
+
+  place_tile_card(btn, col, row, tile);
+
+  // Optional icon label when icon_name is set.
+  lv_obj_t* icon_lbl = nullptr;
+  String iconChar;
+  if (tile.icon_name.length() > 0 && FONT_MDI_ICONS != nullptr) {
+    iconChar = getMdiChar(tile.icon_name);
+  }
+  bool has_icon = iconChar.length() > 0;
+  // Without an own icon a protected tile shows the lock as its icon.
+  const bool locked = navigate_tile_locked(tile);
+  const bool lock_is_icon = locked && !has_icon && FONT_MDI_ICONS != nullptr;
+  if (lock_is_icon) {
+    iconChar = getMdiChar("lock");
+    has_icon = iconChar.length() > 0;
+  }
+  bool has_title = tile.title.length() > 0;
+  // A half-height navigation tile uses the half-height Sensor header: the
+  // icon in the concentric corner disc and the title, if any, beside it.
+  const bool compact = tile_geometry::compact_icon_title(tile.type, tile.span_w, tile.span_h);
+  const tile_icon_disc::IconTitleOffsets offsets =
+      tile_icon_disc::icon_title_offsets(FONT_MDI_ICONS, tile_layout::header_title_font());
+
+  if (has_icon) {
+    icon_lbl = lv_label_create(btn);
+    if (icon_lbl) {
+      set_label_style(icon_lbl, lv_color_hex(ui_theme::icon()), FONT_MDI_ICONS);
+      lv_label_set_text(icon_lbl, iconChar.c_str());
+      tile_icon_source::apply_initial(icon_lbl, tile);
+
+      // Center icon and title on two lines, or the icon alone on one line.
+      if (!compact) {
+        if (has_title) {
+          lv_obj_align(icon_lbl, LV_ALIGN_CENTER, 0, offsets.icon);
+        } else {
+          lv_obj_center(icon_lbl);  // Center the icon when there is no title.
+        }
+        tile_icon_disc::add_round(btn, icon_lbl);
+      }
+    }
+  }
+
+  // Show the title label only when a title is set.
+  lv_obj_t* title_lbl = nullptr;
+  if (has_title) {
+    lv_obj_t* l = lv_label_create(btn);
+    title_lbl = l;
+    if (l) {
+      set_label_style(l, lv_color_hex(ui_theme::text()), tile_layout::header_title_font());
+      hometiles_title::tile(l, tile.title.c_str(), false);
+
+      // Position below the icon, or center when there is no icon.
+      if (compact) {
+        // compact_sensor_layout places it beside the disc below.
+      } else if (icon_lbl) {
+        lv_obj_align(l, LV_ALIGN_CENTER, 0, offsets.title);
+      } else {
+        lv_obj_center(l);  // Center the title when there is no icon.
+      }
+    }
+  }
+  if (compact) compact_sensor_layout::apply(btn, icon_lbl, title_lbl, nullptr, tile);
+  if (locked && !lock_is_icon && icon_lbl) {
+    lv_obj_add_event_cb(icon_lbl, lock_mark_event_cb, LV_EVENT_DRAW_POST, nullptr);
+    lv_obj_add_event_cb(icon_lbl, lock_mark_event_cb, LV_EVENT_REFR_EXT_DRAW_SIZE, nullptr);
+    lv_obj_refresh_ext_draw_size(icon_lbl);
+  }
+
+  // Event handler for tab navigation.
+  static constexpr uint8_t NAV_KIND_FOLDER = 0;
+  static constexpr uint8_t NAV_KIND_SETTINGS = 1;
+  static constexpr uint8_t NAV_KIND_BACK = 2;
+  uint8_t target_kind = NAV_KIND_FOLDER;
+  uint16_t target_folder = 0;
+  if (tile.type == TILE_SETTINGS) {
+    target_kind = NAV_KIND_SETTINGS;
+  } else if (tile.type == TILE_BACK) {
+    target_kind = NAV_KIND_BACK;
+  } else {
+    target_kind = NAV_KIND_FOLDER;
+    target_folder = navFolderIdFromTile(tile);
+  }
+  Serial.printf("[Navigate] Render navigation tile - kind=%u, folder=%u\n",
+                static_cast<unsigned>(target_kind),
+                static_cast<unsigned>(target_folder));
+
+  NavigateEventData* event_data = new NavigateEventData{
+    target_kind,
+    target_folder,
+    tile.title,
+    tile.icon_name,
+    btn_color
+  };
+
+  lv_obj_add_event_cb(
+      btn,
+      [](lv_event_t* e) {
+        if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+        NavigateEventData* data = static_cast<NavigateEventData*>(lv_event_get_user_data(e));
+        if (!data) return;
+        if (data->target_kind == NAV_KIND_SETTINGS) {
+          Serial.printf("[Tile] Navigation CLICKED! Settings, title: %s\n", data->title.c_str());
+          uiManager.requestSettingsAccess();
+        } else if (data->target_kind == NAV_KIND_BACK) {
+          uint16_t current = tileConfig.getActiveFolderId();
+          uint16_t parent = tileConfig.getFolderParent(current);
+          Serial.printf("[Tile] Navigation CLICKED! Back to %u, title: %s\n",
+                        static_cast<unsigned>(parent), data->title.c_str());
+          uiManager.switchToFolder(parent);
+        } else {
+          Serial.printf("[Tile] Navigation CLICKED! Folder %u, title: %s\n",
+                        static_cast<unsigned>(data->target_folder_id), data->title.c_str());
+          // A PIN popup shows the icon in the color the tile shows right now
+          // (fixed or from the source entity).
+          lv_obj_t* icon = tile_icon_source::card_icon(
+              static_cast<lv_obj_t*>(lv_event_get_current_target(e)));
+          const uint32_t icon_color =
+              icon ? lv_color_to_u32(lv_obj_get_style_text_color(icon, LV_PART_MAIN)) & 0xFFFFFF
+                   : 0xFFFFFF;
+          // The PIN popup also inherits a rules tint of the tile.
+          const uint32_t popup_color = tile_icon_source::popup_background(
+              static_cast<lv_obj_t*>(lv_event_get_current_target(e)), data->bg_color);
+          uiManager.requestFolderAccess(data->target_folder_id, data->title,
+                                        data->icon_name,
+                                        popup_color, icon_color);
+        }
+      },
+      LV_EVENT_CLICKED,
+      event_data);
+  lv_obj_add_event_cb(
+      btn,
+      [](lv_event_t* e) {
+        if (lv_event_get_code(e) != LV_EVENT_DELETE) return;
+        NavigateEventData* data = static_cast<NavigateEventData*>(lv_event_get_user_data(e));
+        delete data;
+      },
+      LV_EVENT_DELETE,
+      event_data);
+
+  return btn;
+}
+

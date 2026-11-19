@@ -1,0 +1,78 @@
+#ifndef TAB_TILES_UNIFIED_H
+#define TAB_TILES_UNIFIED_H
+
+#include <lvgl.h>
+#include "src/tiles/runtime/tile_renderer.h"
+
+// Unified tile tab functions - works for HOME, GAME, and WEATHER grids
+void build_tiles_tab(lv_obj_t* parent, GridType grid_type, scene_publish_cb_t scene_cb);
+void tiles_reload_layout(GridType grid_type);
+void tiles_release_layout(GridType grid_type);
+void tiles_release_all();
+bool tiles_is_loaded(GridType grid_type);
+void tiles_request_reload(GridType grid_type);
+void tiles_request_reload_if_loaded(GridType grid_type);
+void tiles_request_reload_all();
+// The theme changed (UIManager::processThemeChange): the tabs and their grids
+// take the new screen color; the tiles rebuild through the reload requests.
+void tiles_apply_screen_color();
+void tiles_request_icon_refresh();
+void tiles_refresh_image_previews_for_key(GridType grid_type, const String& raw_key);
+void tiles_request_release(GridType grid_type);
+void tiles_request_release_all();
+void tiles_process_reload_requests();
+void tiles_process_pending_folder_switch();
+void tiles_refresh_visible_from_cache();
+void tiles_request_visible_cache_refresh();
+void tiles_process_visible_cache_refresh(bool allow_now);
+void tiles_request_bridge_cache_refresh();
+void tiles_process_bridge_cache_refresh(bool allow_now);
+void tiles_update_tile(GridType grid_type, uint8_t index);
+void tiles_update_sensor_by_entity(GridType grid_type, const char* entity_id, const char* value);
+void tiles_update_weather_by_entity(GridType grid_type, const char* entity_id, const char* payload);
+bool tiles_get_cached_entity_payload(const char* entity_id, String& out);
+// Reapplies the rules of visible tiles whose rule entity changed (loop task;
+// tile_update_service.h). Editable values request their tile directly.
+void process_icon_source_updates();
+void tiles_request_rule_refresh(GridType grid_type, uint8_t index);
+bool tiles_get_cached_entity_payload_signature(const char* entity_id,
+                                               uint32_t& hash_out,
+                                               size_t& length_out);
+void tiles_cache_entity_payload(const char* entity_id, const char* payload);
+bool tiles_open_view_popup(uint16_t view_id);
+uint16_t tiles_view_id_for_object(lv_obj_t* object);
+bool tiles_folder_switch_pending();
+void tiles_switch_to_folder(uint16_t folder_id);
+void tiles_cancel_folder_switch(uint16_t folder_id);
+void tiles_invalidate_folder(uint16_t folder_id);
+// Only this folder's grid changed (a reorder): its hidden page caches are
+// dropped, every other prepared folder stays. The visible folder is refreshed
+// by the caller (tiles_show_active_layout_now() or a reload request).
+void tiles_invalidate_folder_only(uint16_t folder_id);
+// Rebuilds the visible folder from the active grid right away instead of
+// waiting for the deferred reload (which waits for a quiet Web Admin). Loop
+// task only, outside LVGL callbacks. False when nothing is shown.
+bool tiles_show_active_layout_now();
+// The pages changed (Web Admin): every prepared grid's head shows its new
+// dots, gear or X; the grids stay. With draw_now the visible head is drawn
+// at once. Loop task only, outside LVGL callbacks.
+void tiles_rebuild_heads(bool draw_now);
+// The tiles tab's visible grid (its head's line leads a page turn).
+lv_obj_t* tiles_visible_grid();
+
+// One tile of a page's picture (page_preview.h): its shown place in cells
+// and its card's color.
+struct PageTileRect {
+  float col;
+  float row;
+  float span_w;
+  float span_h;
+  uint32_t color;
+};
+// A folder's shown tiles: from its built grid when it is cached (the card
+// colors as drawn), else its kept picture (a page's, made when its grid was
+// shown or let go, or while the panel rested), else from its stored grid in
+// the theme's card color. Transparent cards are left out. Loop task only.
+size_t tiles_page_schematic(uint16_t folder_id, PageTileRect* out, size_t max);
+
+#endif // TAB_TILES_UNIFIED_H

@@ -1,0 +1,52 @@
+#pragma once
+
+#include "version.txt"
+
+#if defined(DEVICE_GUITION_JC8012P4A1) && \
+    defined(HOMETILES_ISSUE30_SAFE_BETA)
+#undef FW_VERSION
+#define FW_VERSION "v0.6.8b2"
+#endif
+
+#if defined(DEVICE_GUITION_JC8012P4A1_V2) && \
+    defined(HOMETILES_ISSUE38_BETA)
+#undef FW_VERSION
+#define FW_VERSION "v0.6.12b632"
+#endif
+
+// Camera beta builds of every camera board (HOMETILES_LOCAL_CAMERA in
+// device_select.h) carry the beta number.
+#if defined(HOMETILES_CAMERA_BETA)
+#undef FW_VERSION
+#define FW_VERSION "v0.6.12b632"
+#endif
+
+// Local test builds of the other profiles (for example Waveshare 4B and
+// Guition ESP32-S3) carry the same beta number as the camera builds.
+#if defined(HOMETILES_TEST_BETA) && !defined(HOMETILES_CAMERA_BETA) && \
+    !defined(HOMETILES_ISSUE38_BETA)
+#undef FW_VERSION
+#define FW_VERSION "v0.6.12b632"
+#endif
+
+#if defined(HOMETILES_TEST_BETA) && \
+    (defined(DEVICE_GUITION_ESP32_4848S040) || \
+     defined(DEVICE_GOLDEN_SECURITY_GS_T3E_V2) || \
+     defined(DEVICE_WAVESHARE_S3_TOUCH_LCD_4) || \
+     defined(DEVICE_WAVESHARE_S3_TOUCH_LCD_4B) || \
+     defined(DEVICE_WAVESHARE_S3_TOUCH_LCD_7))
+// Keep the base below v0.7.0 so System Update offers the published OTA target.
+#undef FW_VERSION
+#define FW_VERSION "v0.6.12b632"
+#endif
+
+// Every test build above (it carries a beta number) gets the developer
+// tools, for example the internal storage in the Web Admin file manager.
+#if defined(HOMETILES_ISSUE30_SAFE_BETA) || defined(HOMETILES_ISSUE38_BETA) || \
+    defined(HOMETILES_CAMERA_BETA) || defined(HOMETILES_TEST_BETA)
+#define HOMETILES_BETA_BUILD 1
+#endif
+
+#ifndef FW_VERSION
+#error "FW_VERSION is missing in version.txt"
+#endif

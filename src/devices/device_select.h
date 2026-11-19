@@ -1,0 +1,229 @@
+#pragma once
+
+// Central device selection for the shared project.
+// Arduino IDE builds usually do not provide per-target build flags.
+// For a quick manual switch, uncomment exactly one target below:
+//
+#if !defined(HOMETILES_CI_TARGET)
+#define DEVICE_WAVESHARE_4B
+// #define DEVICE_WAVESHARE_TOUCH_LCD_4_3
+// #define DEVICE_WAVESHARE_TOUCH_LCD_5
+// #define DEVICE_WAVESHARE_TOUCH_LCD_7
+// #define DEVICE_WAVESHARE_TOUCH_LCD_7B
+// #define DEVICE_WAVESHARE_TOUCH_LCD_8
+// #define DEVICE_WAVESHARE_TOUCH_LCD_10_1
+// #define DEVICE_WAVESHARE_S3_TOUCH_LCD_4
+// #define DEVICE_WAVESHARE_S3_TOUCH_LCD_4B
+#define DEVICE_WAVESHARE_S3_TOUCH_LCD_7
+// #define DEVICE_LAYOUT_TEST_1024X600
+// #define DEVICE_LAYOUT_TEST_480X480
+// #define DEVICE_M5STACKS_TAB5
+// #define DEVICE_GUITION_JC8012P4A1
+// #define DEVICE_GUITION_JC8012P4A1_V2
+// #define DEVICE_GUITION_JC1060P470C
+// #define DEVICE_GUITION_JC1060P470C_V2
+// #define DEVICE_GUITION_JC4880P443_PORTRAIT
+// #define DEVICE_GUITION_ESP32_4848S040
+// #define DEVICE_GOLDEN_SECURITY_GS_T3E_V2
+#endif
+//
+// If nothing is selected, the project defaults to Waveshare 4B.
+
+#if defined(DEVICE_TAB5) && !defined(DEVICE_M5STACKS_TAB5)
+#define DEVICE_M5STACKS_TAB5
+#endif
+
+#if defined(DEVICE_WAVESHARE_WIFI6_TOUCH_LCD_8) && !defined(DEVICE_WAVESHARE_TOUCH_LCD_8)
+#define DEVICE_WAVESHARE_TOUCH_LCD_8
+#endif
+
+#if (defined(DEVICE_WAVESHARE_4B) + \
+     defined(DEVICE_WAVESHARE_TOUCH_LCD_4_3) + \
+     defined(DEVICE_WAVESHARE_TOUCH_LCD_5) + \
+     defined(DEVICE_WAVESHARE_TOUCH_LCD_7) + \
+     defined(DEVICE_WAVESHARE_TOUCH_LCD_7B) + \
+     defined(DEVICE_WAVESHARE_TOUCH_LCD_8) + \
+     defined(DEVICE_WAVESHARE_TOUCH_LCD_10_1) + \
+     defined(DEVICE_WAVESHARE_S3_TOUCH_LCD_4) + \
+     defined(DEVICE_WAVESHARE_S3_TOUCH_LCD_4B) + \
+     defined(DEVICE_WAVESHARE_S3_TOUCH_LCD_7) + \
+     defined(DEVICE_LAYOUT_TEST_1024X600) + \
+     defined(DEVICE_LAYOUT_TEST_480X480) + \
+     defined(DEVICE_M5STACKS_TAB5) + \
+     defined(DEVICE_GUITION_JC8012P4A1) + \
+     defined(DEVICE_GUITION_JC8012P4A1_V2) + \
+     defined(DEVICE_GUITION_JC1060P470C) + \
+     defined(DEVICE_GUITION_JC1060P470C_V2) + \
+     defined(DEVICE_GUITION_JC4880P443_PORTRAIT) + \
+     defined(DEVICE_GUITION_ESP32_4848S040) + \
+     defined(DEVICE_GOLDEN_SECURITY_GS_T3E_V2)) > 1
+#error "Select only one device target."
+#endif
+
+#if !defined(DEVICE_WAVESHARE_4B) && \
+    !defined(DEVICE_WAVESHARE_TOUCH_LCD_4_3) && \
+    !defined(DEVICE_WAVESHARE_TOUCH_LCD_5) && \
+    !defined(DEVICE_WAVESHARE_TOUCH_LCD_7) && \
+    !defined(DEVICE_WAVESHARE_TOUCH_LCD_7B) && \
+    !defined(DEVICE_WAVESHARE_TOUCH_LCD_8) && \
+    !defined(DEVICE_WAVESHARE_TOUCH_LCD_10_1) && \
+    !defined(DEVICE_WAVESHARE_S3_TOUCH_LCD_4) && \
+    !defined(DEVICE_WAVESHARE_S3_TOUCH_LCD_4B) && \
+    !defined(DEVICE_WAVESHARE_S3_TOUCH_LCD_7) && \
+    !defined(DEVICE_LAYOUT_TEST_1024X600) && \
+    !defined(DEVICE_LAYOUT_TEST_480X480) && \
+    !defined(DEVICE_M5STACKS_TAB5) && \
+    !defined(DEVICE_GUITION_JC8012P4A1) && \
+    !defined(DEVICE_GUITION_JC8012P4A1_V2) && \
+    !defined(DEVICE_GUITION_JC1060P470C) && \
+    !defined(DEVICE_GUITION_JC1060P470C_V2) && \
+    !defined(DEVICE_GUITION_JC4880P443_PORTRAIT) && \
+    !defined(DEVICE_GUITION_ESP32_4848S040) && \
+    !defined(DEVICE_GOLDEN_SECURITY_GS_T3E_V2) && \
+    defined(HOMETILES_CI_TARGET)
+#error "HOMETILES_CI_TARGET requires one DEVICE_* build flag."
+#endif
+
+#if !defined(DEVICE_WAVESHARE_4B) && \
+    !defined(DEVICE_WAVESHARE_TOUCH_LCD_4_3) && \
+    !defined(DEVICE_WAVESHARE_TOUCH_LCD_5) && \
+    !defined(DEVICE_WAVESHARE_TOUCH_LCD_7) && \
+    !defined(DEVICE_WAVESHARE_TOUCH_LCD_7B) && \
+    !defined(DEVICE_WAVESHARE_TOUCH_LCD_8) && \
+    !defined(DEVICE_WAVESHARE_TOUCH_LCD_10_1) && \
+    !defined(DEVICE_WAVESHARE_S3_TOUCH_LCD_4) && \
+    !defined(DEVICE_WAVESHARE_S3_TOUCH_LCD_4B) && \
+    !defined(DEVICE_WAVESHARE_S3_TOUCH_LCD_7) && \
+    !defined(DEVICE_LAYOUT_TEST_1024X600) && \
+    !defined(DEVICE_LAYOUT_TEST_480X480) && \
+    !defined(DEVICE_M5STACKS_TAB5) && \
+    !defined(DEVICE_GUITION_JC8012P4A1) && \
+    !defined(DEVICE_GUITION_JC8012P4A1_V2) && \
+    !defined(DEVICE_GUITION_JC1060P470C) && \
+    !defined(DEVICE_GUITION_JC1060P470C_V2) && \
+    !defined(DEVICE_GUITION_JC4880P443_PORTRAIT) && \
+    !defined(DEVICE_GUITION_ESP32_4848S040) && \
+    !defined(DEVICE_GOLDEN_SECURITY_GS_T3E_V2) && \
+    !defined(HOMETILES_CI_TARGET)
+#define DEVICE_WAVESHARE_4B
+#endif
+
+// Both JC8012 revisions share the board-level UI and lifecycle behavior, but
+// retain separate device drivers, display tables and OTA identities.
+#if defined(DEVICE_GUITION_JC8012P4A1) || \
+    defined(DEVICE_GUITION_JC8012P4A1_V2)
+#define DEVICE_GUITION_JC8012P4A1_FAMILY
+#endif
+
+// These Waveshare P4 products share the same I2C/touch, backlight, SDMMC and
+// ESP-Hosted pin contracts. Each exact panel keeps its own controller, timing,
+// layout and device driver or board description.
+#if defined(DEVICE_WAVESHARE_TOUCH_LCD_4_3) || \
+    defined(DEVICE_WAVESHARE_TOUCH_LCD_5) || \
+    defined(DEVICE_WAVESHARE_TOUCH_LCD_7) || \
+    defined(DEVICE_WAVESHARE_TOUCH_LCD_7B) || \
+    defined(DEVICE_WAVESHARE_TOUCH_LCD_8) || \
+    defined(DEVICE_WAVESHARE_TOUCH_LCD_10_1) || \
+    defined(DEVICE_LAYOUT_TEST_1024X600) || \
+    defined(DEVICE_LAYOUT_TEST_480X480)
+#define DEVICE_WAVESHARE_TOUCH_LCD_X
+#endif
+
+// The Waveshare 5-inch's own MIPI-DSI driver
+// (src/devices/waveshare_touch_lcd_5/dsi_driver): a portrait panel under a
+// landscape profile, its panel controller, timing and pins in its board.h.
+#if defined(DEVICE_WAVESHARE_TOUCH_LCD_5)
+#define DEVICE_WAVESHARE_P4_DSI_BOARD
+#endif
+
+// Both JC1060 panel revisions share board-level storage, touch, backlight and
+// lifecycle behavior. Their panel reset pin, timing and init table stay in
+// separate exact device drivers.
+#if defined(DEVICE_GUITION_JC1060P470C) || \
+    defined(DEVICE_GUITION_JC1060P470C_V2)
+#define DEVICE_GUITION_JC1060P470C_FAMILY
+#endif
+
+// Built-in camera on every ESP32-P4 board with a camera: the Guition
+// JC8012P4A1 V2 and V1 cameras and the JC1060P470C V2 / JC4880P443 CSI
+// connectors (OV02C10), the Waveshare 8-inch, 7-inch and 10.1-inch front
+// cameras and the OV5647 CSI connectors of the Waveshare 7B, 4.3-inch, 5-inch
+// and 4B, and the M5Stack Tab5 camera (SC202CS/SC2356). The camera stays off
+// until the user enables it in the Web Admin; only then is the sensor probed.
+// The original-panel JC1060P470C (board identity unproven) and the ESP32-S3
+// boards keep the capture path out.
+#if defined(DEVICE_GUITION_JC8012P4A1_V2) || \
+    defined(DEVICE_WAVESHARE_TOUCH_LCD_8) || \
+    defined(DEVICE_WAVESHARE_TOUCH_LCD_7) || \
+    defined(DEVICE_WAVESHARE_TOUCH_LCD_10_1) || \
+    defined(DEVICE_WAVESHARE_TOUCH_LCD_7B) || \
+    defined(DEVICE_WAVESHARE_TOUCH_LCD_4_3) || \
+    defined(DEVICE_WAVESHARE_TOUCH_LCD_5) || \
+    defined(DEVICE_WAVESHARE_4B) || \
+    defined(DEVICE_GUITION_JC8012P4A1) || \
+    defined(DEVICE_GUITION_JC1060P470C_V2) || \
+    defined(DEVICE_GUITION_JC4880P443_PORTRAIT) || \
+    defined(DEVICE_M5STACKS_TAB5)
+#define HOMETILES_LOCAL_CAMERA 1
+#endif
+
+// Native ESP-IDF MIPI-DSI profiles share the same two-framebuffer camera
+// presenter. M5GFX Tab5 and Arduino_GFX B4 intentionally keep their library
+// owned display backends.
+#if defined(DEVICE_WAVESHARE_TOUCH_LCD_4_3) || \
+    defined(DEVICE_WAVESHARE_TOUCH_LCD_5) || \
+    defined(DEVICE_WAVESHARE_TOUCH_LCD_7) || \
+    defined(DEVICE_WAVESHARE_TOUCH_LCD_7B) || \
+    defined(DEVICE_WAVESHARE_TOUCH_LCD_8) || \
+    defined(DEVICE_WAVESHARE_TOUCH_LCD_10_1) || \
+    defined(DEVICE_GUITION_JC8012P4A1) || \
+    defined(DEVICE_GUITION_JC8012P4A1_V2) || \
+    defined(DEVICE_GUITION_JC1060P470C) || \
+    defined(DEVICE_GUITION_JC1060P470C_V2) || \
+    defined(DEVICE_GUITION_JC4880P443_PORTRAIT)
+#define DEVICE_P4_IDF_DSI
+#endif
+
+// Boards built like the Guition ESP32-4848S040 (ESP32-S3, 8 MB octal PSRAM,
+// 480x480 ST7701 RGB panel, GT911) share its board-level behavior outside the
+// driver: the update-check pixel-clock guard, loop-stall diagnostics, the
+// brightness floor and the compact dropdown arrow. Each board has its own
+// driver, pins, profile and firmware identity.
+#if defined(DEVICE_GUITION_ESP32_4848S040) || \
+    defined(DEVICE_GOLDEN_SECURITY_GS_T3E_V2)
+#define DEVICE_GUITION_ESP32_4848S040_FAMILY
+#endif
+
+// The ESP32-S3 RGB boards share only proven S3 framebuffer, storage and OTA
+// lifecycle handling. Panel wiring, resolution and init remain separate.
+#if defined(DEVICE_GUITION_ESP32_4848S040) || \
+    defined(DEVICE_GOLDEN_SECURITY_GS_T3E_V2) || \
+    defined(DEVICE_WAVESHARE_S3_TOUCH_LCD_4) || \
+    defined(DEVICE_WAVESHARE_S3_TOUCH_LCD_4B) || \
+    defined(DEVICE_WAVESHARE_S3_TOUCH_LCD_7)
+#define DEVICE_ESP32_S3_RGB_480
+#endif
+
+#if defined(DEVICE_LAYOUT_TEST_1024X600) || \
+    defined(DEVICE_WAVESHARE_TOUCH_LCD_7B) || \
+    defined(DEVICE_GUITION_JC1060P470C) || \
+    defined(DEVICE_GUITION_JC1060P470C_V2)
+#define DEVICE_LAYOUT_1024X600
+#endif
+
+#if defined(DEVICE_LAYOUT_TEST_480X480) || \
+    defined(DEVICE_WAVESHARE_TOUCH_LCD_4_3) || \
+    defined(DEVICE_GUITION_JC4880P443_PORTRAIT) || \
+    defined(DEVICE_GUITION_ESP32_4848S040) || \
+    defined(DEVICE_GOLDEN_SECURITY_GS_T3E_V2) || \
+    defined(DEVICE_WAVESHARE_S3_TOUCH_LCD_4) || \
+    defined(DEVICE_WAVESHARE_S3_TOUCH_LCD_4B)
+#define DEVICE_LAYOUT_480X480
+#endif
+
+// The 8" and 10.1" panels share the 1280x800 HomeTiles layout.
+#if defined(DEVICE_WAVESHARE_TOUCH_LCD_8) || \
+    defined(DEVICE_WAVESHARE_TOUCH_LCD_10_1)
+#define DEVICE_WAVESHARE_TOUCH_LCD_1280X800
+#endif
+

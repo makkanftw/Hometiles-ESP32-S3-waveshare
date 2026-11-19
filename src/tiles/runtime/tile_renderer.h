@@ -1,0 +1,164 @@
+#ifndef TILE_RENDERER_H
+#define TILE_RENDERER_H
+
+#include <lvgl.h>
+#include <type_traits>
+#include "src/tiles/config/tile_config.h"
+#include "src/types/sensor/widgets.h"
+#include "src/types/switch/state.h"
+#include "src/types/cover/state.h"
+#include "src/types/binary_sensor/state.h"
+#include "src/types/climate/state.h"
+#include "src/types/weather/widgets.h"
+#include "src/types/media/widgets.h"
+
+// Forward declarations
+typedef void (*scene_publish_cb_t)(const char* scene_alias);
+
+enum class GridType : uint8_t {
+  TAB0 = 0,
+  TAB1 = 1,
+  TAB2 = 2,
+  SCREENSAVER = 3
+};
+
+struct TileWidgetCache {
+  SensorTileWidgets sensors[TILES_PER_GRID];
+  SwitchTileWidgets switches[TILES_PER_GRID];
+  SwitchState switch_states[TILES_PER_GRID];
+  ClimateTileWidgets climate[TILES_PER_GRID];
+  ClimateState climate_states[TILES_PER_GRID];
+  CoverTileWidgets covers[TILES_PER_GRID];
+  CoverState cover_states[TILES_PER_GRID];
+  BinarySensorTileWidgets binary_sensors[TILES_PER_GRID];
+  BinarySensorState binary_sensor_states[TILES_PER_GRID];
+  WeatherTileWidgets weather[TILES_PER_GRID];
+  MediaTileWidgets media[TILES_PER_GRID];
+};
+// Allocated with heap_caps_calloc, copied with memcpy and cleared in place.
+static_assert(std::is_trivially_copyable<TileWidgetCache>::value,
+              "TileWidgetCache is copied with memcpy");
+
+// Allocate the per-slot renderer bookkeeping of every grid (Sensor, Switch,
+// Cover, Climate, Weather, Media and Binary Sensor widgets and states) in
+// PSRAM. Every chip uses this storage; internal RAM is scarce on P4 and S3.
+// setup() calls it before the UI task and the MQTT worker start; the storage
+// is never freed.
+bool tile_renderer_init_cold_storage();
+
+// Renders a complete tile grid.
+void render_tile_grid(lv_obj_t* parent, const TileGridConfig& config, GridType grid_type,
+                      scene_publish_cb_t scene_cb = nullptr, lv_obj_t** out_tile_objs = nullptr);
+
+// Renders one tile according to its type and returns the created object.
+lv_obj_t* render_tile(lv_obj_t* parent, int col, int row, const Tile& tile, uint8_t index, GridType grid_type, scene_publish_cb_t scene_cb);
+
+// Type-specific render functions
+lv_obj_t* render_sensor_tile(lv_obj_t* parent, int col, int row, const Tile& tile, uint8_t index, GridType grid_type);
+lv_obj_t* render_scene_tile(lv_obj_t* parent, int col, int row, const Tile& tile, uint8_t index, scene_publish_cb_t scene_cb);
+lv_obj_t* render_key_tile(lv_obj_t* parent, int col, int row, const Tile& tile, uint8_t index, GridType grid_type);
+lv_obj_t* render_navigate_tile(lv_obj_t* parent, int col, int row, const Tile& tile, uint8_t index);
+lv_obj_t* render_switch_tile(lv_obj_t* parent, int col, int row, const Tile& tile, uint8_t index, GridType grid_type);
+lv_obj_t* render_clock_tile(lv_obj_t* parent, int col, int row, const Tile& tile, uint8_t index);
+lv_obj_t* render_text_tile(lv_obj_t* parent, int col, int row, const Tile& tile, uint8_t index);
+lv_obj_t* render_counter_tile(lv_obj_t* parent, int col, int row, const Tile& tile, uint8_t index, GridType grid_type);
+lv_obj_t* render_weather_tile(lv_obj_t* parent, int col, int row, const Tile& tile, uint8_t index, GridType grid_type);
+lv_obj_t* render_media_tile(lv_obj_t* parent, int col, int row, const Tile& tile, uint8_t index, GridType grid_type);
+lv_obj_t* render_empty_tile(lv_obj_t* parent, int col, int row);
+
+// Update entry points for sensor values.
+void update_sensor_tile_value(GridType grid_type, uint8_t grid_index, const char* value, const char* unit = nullptr);
+void reset_sensor_widget(GridType grid_type, uint8_t grid_index);
+void reset_sensor_widgets(GridType grid_type);
+
+// Thread-safe sensor update queue (MQTT callback -> main loop).
+void queue_sensor_tile_update(GridType grid_type, uint8_t grid_index, const char* value, const char* unit = nullptr);
+void process_sensor_update_queue(uint8_t max_updates = 0);  // 0 drains the queue
+// True once after the sensor queue overwrote an update that was not applied.
+bool tile_renderer_take_sensor_queue_overflow();
+
+// Switch widget reset functions
+void reset_switch_widget(GridType grid_type, uint8_t grid_index);
+void reset_switch_widgets(GridType grid_type);
+
+// Thread-safe switch update queue (MQTT callback -> main loop).
+// A batched mask must contain slots for one entity. max_updates limits applied
+// slots, not payload batches; a partly applied payload resumes without reparse.
+// Single-slot cache updates are layout-generation-bound so hidden folder
+// preloading keeps working without delivering stale state after a rebuild.
+void queue_switch_tile_update(GridType grid_type, uint8_t grid_index, const char* payload);
+void queue_switch_tile_updates(GridType grid_type, uint64_t grid_indices,
+                               const char* payload);
+void process_switch_update_queue(uint8_t max_updates = 0);  // 0 drains the queue
+
+void reset_climate_widget(GridType grid_type, uint8_t grid_index);
+void reset_climate_widgets(GridType grid_type);
+void queue_climate_tile_update(GridType grid_type, uint8_t grid_index, const char* payload);
+void process_climate_update_queue(uint8_t max_updates = 0);
+String climate_tile_base_icon(const Tile& tile);
+String climate_visual_icon(
+    const ClimateState& state, const String& base_icon = "thermostat");
+uint32_t climate_visual_color(const ClimateState& state);
+// Icon colors of a raw Switch/light or Climate state payload as their tiles
+// show them; false while the payload has no available state. `active` (when
+// given) tells whether the entity is on or running rather than off.
+bool switch_payload_icon_color(const char* payload, uint32_t& rgb, bool* active = nullptr);
+// The Switch tile's icon color for a state (grey while off or unavailable).
+uint32_t switch_state_icon_color(const SwitchState& state);
+bool climate_payload_icon_color(const char* payload, uint32_t& rgb, bool* active = nullptr);
+
+CoverTileWidgets* tile_renderer_get_cover_widgets(GridType grid_type);
+CoverState* tile_renderer_get_cover_states(GridType grid_type);
+void reset_cover_widget(GridType grid_type, uint8_t grid_index);
+void reset_cover_widgets(GridType grid_type);
+void queue_cover_tile_update(GridType grid_type, uint8_t grid_index,
+                             const char* payload);
+void process_cover_update_queue(uint8_t max_updates = 0);
+
+// Part of tile_renderer_init_cold_storage(); true once the storage exists.
+bool binary_sensor_init_storage();
+BinarySensorTileWidgets* tile_renderer_get_binary_sensor_widgets(
+    GridType grid_type);
+BinarySensorState* tile_renderer_get_binary_sensor_states(GridType grid_type);
+void reset_binary_sensor_widget(GridType grid_type, uint8_t grid_index);
+void reset_binary_sensor_widgets(GridType grid_type);
+void queue_binary_sensor_tile_update(GridType grid_type, uint8_t grid_index,
+                                     const char* payload);
+void queue_binary_sensor_tile_updates(GridType grid_type,
+                                      uint64_t grid_indices,
+                                      const char* payload);
+void process_binary_sensor_update_queue(uint8_t max_updates = 0);
+
+void reset_weather_widget(GridType grid_type, uint8_t grid_index);
+void reset_weather_widgets(GridType grid_type);
+// The Bridge stored a new picture of this player (bridge_images.h): tiles
+// whose song it belongs to show it, and an open Media popup with them.
+void tile_renderer_media_picture_arrived(const char* entity_id);
+void queue_weather_tile_update(GridType grid_type, uint8_t grid_index, const char* payload);
+void process_weather_update_queue(uint8_t max_updates = 0);  // 0 drains the queue
+
+// UI-thread lookup for the deferred popup body; the caller copies pixels immediately.
+const lv_image_dsc_t* tile_renderer_find_media_cover(const String& entity_id, uint32_t& hash);
+// The "From cover" color a shown media card of the entity sampled from its
+// cover (media/cover_color.h); false without a shown cover or a clear color.
+// For the Web Admin preview, on the UI thread.
+bool tile_renderer_media_cover_color(const String& entity_id, uint32_t& rgb);
+void reset_media_widget(GridType grid_type, uint8_t grid_index);
+void reset_media_widgets(GridType grid_type);
+void queue_media_tile_update(GridType grid_type, uint8_t grid_index, const char* payload);
+void process_media_update_queue(uint8_t max_updates = 0);  // 0 drains the queue
+
+// Thread-safe tile graph history queue (MQTT callback -> main loop).
+void queue_tile_graph_history(const char* entity_id, const char* payload, size_t len);
+void process_tile_graph_queue();  // Call from the main loop before lv_timer_handler().
+// Graph tiles of the shown grid ask for their day again once the connection
+// is up and every five minutes; call from the main loop.
+void tile_graph_service_periodic();
+// A page was shown: its graph tiles without a day ask at once.
+void tile_graph_request_soon();
+void request_tile_graph_history(const char* entity_id);  // Request history for an entity.
+
+void tile_renderer_snapshot_tab0(TileWidgetCache* out);
+void tile_renderer_restore_tab0(const TileWidgetCache* in);
+
+#endif // TILE_RENDERER_H

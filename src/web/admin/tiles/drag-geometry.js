@@ -1,0 +1,312 @@
+
+  let dragSource = null;
+  let dragPreview = null;
+  let dragPlaceholder = null;
+  let resizeState = null;
+  let resizePlaceholder = null;
+  let deferredSensorRefresh = false;
+  let deferredSensorRefreshTiles = false;
+
+  function queueDeferredSensorRefresh(refreshTiles = false) {
+    deferredSensorRefresh = true;
+    deferredSensorRefreshTiles = deferredSensorRefreshTiles || refreshTiles;
+  }
+
+  function clearDeferredSensorRefresh() {
+    deferredSensorRefresh = false;
+    deferredSensorRefreshTiles = false;
+  }
+
+  function flushDeferredSensorRefresh() {
+    if (!deferredSensorRefresh || dragSource || resizeState) return;
+    const refreshTiles = deferredSensorRefreshTiles;
+    clearDeferredSensorRefresh();
+    loadSensorValues(refreshTiles, true);
+  }
+
+  function createDragPreview(tile) {
+    const clone = tile.cloneNode(true);
+    // No second element with the tile's id (getElementById, selection).
+    clone.removeAttribute('id');
+    const rect = tile.getBoundingClientRect();
+    // The tile's own display: a forced block dropped the flex centering of
+    // Folder, Settings and Switch tiles, so the drag image showed icon and
+    // disc at the top left (user 2026-10-02).
+    const display = getComputedStyle(tile).display;
+    clone.style.position = 'absolute';
+    clone.style.top = '-9999px';
+    clone.style.left = '-9999px';
+    clone.style.width = rect.width + 'px';
+    clone.style.height = rect.height + 'px';
+    clone.style.opacity = '0.9';
+    clone.style.pointerEvents = 'none';
+    clone.style.boxShadow = '0 10px 30px rgba(0,0,0,0.35)';
+    clone.style.backgroundClip = 'padding-box';
+    clone.style.clipPath = 'inset(0 round 11px)';
+    clone.style.display = display === 'none' ? 'block' : display;
+    document.body.appendChild(clone);
+    return clone;
+  }
+
+  function getTileGrid(tab) {
+    return document.querySelector('#tab-tiles-' + tab + ' .tile-grid');
+  }
+
+  function parseGridTrackSizes(value) {
+    return String(value || '')
+      .split(' ')
+      .map(part => parseFloat(part))
+      .filter(part => !isNaN(part) && part > 0);
+  }
+
+  function getGridElementMetrics(grid, columns, rows) {
+    if (!grid) return null;
+    const style = window.getComputedStyle(grid);
+    const rect = grid.getBoundingClientRect();
+    const gapX = parseFloat(style.columnGap || style.gap || '0') || 0;
+    const gapY = parseFloat(style.rowGap || style.gap || '0') || 0;
+    const padLeft = parseFloat(style.paddingLeft || '0') || 0;
+    const padTop = parseFloat(style.paddingTop || '0') || 0;
+    const padRight = parseFloat(style.paddingRight || '0') || 0;
+    const padBottom = parseFloat(style.paddingBottom || '0') || 0;
+    const cols = parseGridTrackSizes(style.gridTemplateColumns);
+    const gridRows = parseGridTrackSizes(style.gridTemplateRows);
+    const columnCount = Math.max(1, Number(columns) || cols.length || 1);
+    const rowCount = Math.max(1, Number(rows) || gridRows.length || 1);
+    const cellW = cols.length
+      ? cols[0]
+      : ((rect.width - padLeft - padRight -
+          (gapX * (columnCount - 1))) / columnCount);
+    const cellH = gridRows.length
+      ? gridRows[0]
+      : ((rect.height - padTop - padBottom -
+          (gapY * (rowCount - 1))) / rowCount);
+    // With align-content:space-between (Climate slots) the effective row
+    // spacing exceeds the nominal gap. Derive it from the leftover area so the
+    // pointer-to-cell mapping is correct there too; identical for 1fr grids.
+    let effGapX = gapX;
+    let effGapY = gapY;
+    if (columnCount > 1 && isFinite(cellW)) {
+      effGapX = Math.max(gapX,
+        (rect.width - padLeft - padRight - (columnCount * cellW)) /
+        (columnCount - 1));
+    }
+    if (rowCount > 1 && isFinite(cellH)) {
+      effGapY = Math.max(gapY,
+        (rect.height - padTop - padBottom - (rowCount * cellH)) /
+        (rowCount - 1));
+    }
+    return {
+      rect, gapX: effGapX, gapY: effGapY, padLeft, padTop,
+      cellW, cellH, columns: columnCount, rows: rowCount
+    };
+  }
+
+  function getGridElementCellFromPointer(
+      grid, columns, rows, clientX, clientY) {
+    const metrics = getGridElementMetrics(grid, columns, rows);
+    if (!metrics) return null;
+    const stepX = metrics.cellW + metrics.gapX;
+    const stepY = metrics.cellH + metrics.gapY;
+    let relX = clientX - metrics.rect.left - metrics.padLeft;
+    let relY = clientY - metrics.rect.top - metrics.padTop;
+    if (!isFinite(relX) || !isFinite(relY)) return null;
+    relX = Math.max(0, relX);
+    relY = Math.max(0, relY);
+    const col = Math.max(
+      0, Math.min(
+        metrics.columns - 1,
+        Math.floor((relX + (metrics.gapX / 2)) / stepX)));
+    const row = Math.max(
+      0, Math.min(
+        metrics.rows - 1,
+        Math.floor((relY + (metrics.gapY / 2)) / stepY)));
+    return { col, row };
+  }
+
+  function getTileGridMetrics(tab) {
+    const grid = getTileGrid(tab);
+    return getGridElementMetrics(grid, placeCols(tab), placeRows(tab));
+  }
+
+  function getRawGridCellFromPointer(tab, clientX, clientY, sizeStep = null) {
+    const metrics = getTileGridMetrics(tab);
+    if (!metrics) return null;
+    const stepX = metrics.cellW + metrics.gapX;
+    const stepY = metrics.cellH + metrics.gapY;
+    let relX = clientX - metrics.rect.left - metrics.padLeft;
+    let relY = clientY - metrics.rect.top - metrics.padTop;
+    if (!isFinite(relX) || !isFinite(relY)) return null;
+    relX = Math.max(0, relX);
+    relY = Math.max(0, relY);
+    const unit = sizeStep ?? 0.5;
+    let col = Math.floor((relX + (metrics.gapX / 2)) / (stepX * unit)) * unit;
+    let row = Math.floor((relY + (metrics.gapY / 2)) / (stepY * unit)) * unit;
+    if (!isFinite(col)) col = 0;
+    if (!isFinite(row)) row = 0;
+    if (col < 0) col = 0;
+    const firstRow = firstAllowedGridRow(tab);
+    if (row < firstRow) row = firstRow;
+    if (col >= placeCols(tab)) col = placeCols(tab) - unit;
+    if (row >= placeRows(tab)) row = placeRows(tab) - unit;
+    return { col, row };
+  }
+
+  function getGridCellFromPointer(tab, clientX, clientY) {
+    if (dragSource && dragSource.tab === tab && dragSource.dropOffset) {
+      // The drop spot is the half cell nearest to the drag image's top-left
+      // corner, so it always lies under the dragged tile; the half cell under
+      // the pointer put it up to a half cell off (user 2026-10-02).
+      const metrics = getTileGridMetrics(tab);
+      if (!metrics) return null;
+      const halfX = (metrics.cellW + metrics.gapX) / 2;
+      const halfY = (metrics.cellH + metrics.gapY) / 2;
+      const left = clientX - dragSource.dropOffset.x - metrics.rect.left - metrics.padLeft;
+      const top = clientY - dragSource.dropOffset.y - metrics.rect.top - metrics.padTop;
+      if (!isFinite(left) || !isFinite(top) || !(halfX > 0) || !(halfY > 0)) return null;
+      const layout = getDragSourceLayout();
+      return {
+        col: Math.max(0, Math.min(placeCols(tab) - (layout?.span_w || 0.5), Math.round(left / halfX) / 2)),
+        row: Math.max(firstAllowedGridRow(tab),
+                      Math.min(placeRows(tab) - (layout?.span_h || 0.5), Math.round(top / halfY) / 2))
+      };
+    }
+    const rawCell = getRawGridCellFromPointer(tab, clientX, clientY);
+    if (!rawCell) return null;
+    if (!dragSource || dragSource.tab !== tab) return rawCell;
+    const anchorCol = clampHalf(dragSource.grabCellCol, 0, placeCols(tab) - 1, 0);
+    const anchorRow = clampHalf(dragSource.grabCellRow, 0, placeRows(tab) - 1, 0);
+    return {
+      col: rawCell.col - anchorCol,
+      row: rawCell.row - anchorRow
+    };
+  }
+
+  function getTileLayoutFromData(tab, index) {
+    const tiles = getTilesData(tab);
+    if (!Array.isArray(tiles) || index < 0 || index >= tiles.length) return null;
+    return normalizeTileLayout(tiles[index], index, tab);
+  }
+
+  function getDragSourceLayout() {
+    if (!dragSource) return null;
+    return dragSource.layout ||
+      getTileElementLayout(dragSource.tab, dragSource.index) ||
+      getTileLayoutFromData(dragSource.tab, dragSource.index);
+  }
+
+  // The pointer's offset from the tile's grid corner, measured in the grid
+  // frame (getTileGridMetrics) that the drop spot is snapped in.
+  function getDragLayoutOffset(tab, layout, clientX, clientY) {
+    const metrics = getTileGridMetrics(tab);
+    if (!metrics || !layout) return null;
+    return {
+      x: clientX - metrics.rect.left - metrics.padLeft - layout.col * (metrics.cellW + metrics.gapX),
+      y: clientY - metrics.rect.top - metrics.padTop - layout.row * (metrics.cellH + metrics.gapY)
+    };
+  }
+
+  function getDragAnchorCell(tab, layout, clientX, clientY) {
+    const rawCell = getRawGridCellFromPointer(tab, clientX, clientY);
+    if (!layout || !rawCell) return { col: 0, row: 0 };
+    const unit = 0.5;
+    const col = clampHalf(rawCell.col - layout.col, 0, Math.max(0, layout.span_w - unit), 0);
+    const row = clampHalf(rawCell.row - layout.row, 0, Math.max(0, layout.span_h - unit), 0);
+    return { col, row };
+  }
+
+  // Where the pointer took the tile: the drag image stays exactly under the
+  // pointer. Centering it on the grabbed half cell moved it by up to a quarter
+  // tile (user 2026-10-02: a dragged tile sat slightly off).
+  function getDragGrabOffset(tileRect, clientX, clientY) {
+    const rect = tileRect || { left: 0, top: 0, width: 0, height: 0 };
+    return {
+      x: Math.max(0, Math.min(Math.max(0, rect.width - 1), clientX - rect.left)),
+      y: Math.max(0, Math.min(Math.max(0, rect.height - 1), clientY - rect.top))
+    };
+  }
+
+  function cloneLayout(layout) {
+    if (!layout) return null;
+    return {
+      col: layout.col,
+      row: layout.row,
+      span_w: layout.span_w,
+      span_h: layout.span_h
+    };
+  }
+
+  function captureLayoutSnapshot(tab) {
+    const tiles = getTilesData(tab);
+    const count = Math.max(Array.isArray(tiles) ? tiles.length : 0, TILES_PER_GRID);
+    const snapshot = [];
+    for (let i = 0; i < count; i++) {
+      const layout = getTileElementLayout(tab, i) || getTileLayoutFromData(tab, i);
+      snapshot[i] = cloneLayout(layout);
+    }
+    return snapshot;
+  }
+
+  function clearReflowPreviewClasses(tab) {
+    document.querySelectorAll('#tab-tiles-' + tab + ' .tile').forEach(tile => {
+      tile.classList.remove('reflow-preview');
+    });
+  }
+
+  function layoutsEqual(a, b) {
+    if (!a || !b) return false;
+    return a.col === b.col &&
+           a.row === b.row &&
+           a.span_w === b.span_w &&
+           a.span_h === b.span_h;
+  }
+
+  function restoreDragPreview(tab) {
+    if (!dragSource || dragSource.tab !== tab || !Array.isArray(dragSource.baseLayouts)) {
+      clearReflowPreviewClasses(tab);
+      return;
+    }
+    const tiles = getTilesData(tab);
+    dragSource.previewResult = null;
+    dragSource.appliedPreviewResult = null;
+    dragSource.previewKey = '';
+    for (let i = 0; i < dragSource.baseLayouts.length; i++) {
+      const tile = Array.isArray(tiles) ? tiles[i] : null;
+      if (!tileTakesRoom(tile)) continue;
+      const el = document.getElementById(tab + '-tile-' + i);
+      const layout = dragSource.baseLayouts[i];
+      if (!el || !layout) continue;
+      setTileGridPosition(el, layout.col, layout.row, layout.span_w, layout.span_h);
+    }
+    clearReflowPreviewClasses(tab);
+  }
+
+  function applyDragPreviewLayouts(tab, previewResult) {
+    if (!dragSource || dragSource.tab !== tab || !previewResult || !Array.isArray(previewResult.layouts)) return;
+    const tiles = getTilesData(tab);
+    for (let i = 0; i < previewResult.layouts.length; i++) {
+      const tile = Array.isArray(tiles) ? tiles[i] : null;
+      if (!tileTakesRoom(tile)) continue;
+      const el = document.getElementById(tab + '-tile-' + i);
+      if (!el) continue;
+
+      const baseLayout = dragSource.baseLayouts && dragSource.baseLayouts[i] ? dragSource.baseLayouts[i] : null;
+      const previewLayout = previewResult.layouts[i] || baseLayout;
+      if (i === dragSource.index) {
+        if (previewLayout) {
+          setTileGridPosition(el, previewLayout.col, previewLayout.row, previewLayout.span_w, previewLayout.span_h);
+        } else if (baseLayout) {
+          setTileGridPosition(el, baseLayout.col, baseLayout.row, baseLayout.span_w, baseLayout.span_h);
+        }
+        el.classList.remove('reflow-preview');
+        continue;
+      }
+      if (!previewLayout) continue;
+      setTileGridPosition(el, previewLayout.col, previewLayout.row, previewLayout.span_w, previewLayout.span_h);
+
+      const changed = !!(baseLayout &&
+        (baseLayout.col !== previewLayout.col || baseLayout.row !== previewLayout.row));
+      el.classList.toggle('reflow-preview', changed);
+    }
+    dragSource.appliedPreviewResult = previewResult;
+  }

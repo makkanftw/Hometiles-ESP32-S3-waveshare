@@ -1,0 +1,163 @@
+  let tabSwitchSequence = 0;
+
+  function folderIdFromAdminTabName(tabName) {
+    const match = /^tab-tiles-folder(\d+)$/.exec(String(tabName || ''));
+    return match ? Number(match[1]) : null;
+  }
+
+  // Each tab button names the panel it opens, so the active one is found by that
+  // attribute instead of by scanning its inline handler for a quoted name.
+  // aria-current tells assistive technology which tab is open; the active class
+  // only paints it.
+  function setActiveTabButton(tabName) {
+    const buttons = Array.from(document.querySelectorAll('.tab-btn'));
+    buttons.forEach(button => {
+      button.classList.remove('active');
+      button.removeAttribute('aria-current');
+    });
+    const active = buttons.find(button => button.dataset.tabTarget === tabName);
+    if (active) {
+      active.classList.add('active');
+      active.setAttribute('aria-current', 'page');
+    }
+  }
+
+
+  async function switchTab(tabName) {
+    // I/O became a Settings page; a remembered or linked I/O tab opens it.
+    if (tabName === 'tab-hardware') {
+      tabName = 'tab-network';
+      showSettingsPage('io');
+    }
+    const sequence = ++tabSwitchSequence;
+    const picks = tileSelectionSeq;
+    let target = document.getElementById(tabName);
+    if (!target) {
+      const folderId = folderIdFromAdminTabName(tabName);
+      if (folderId !== null) {
+        const loaded = await ensureFolderTabUi(folderId);
+        if (!loaded || sequence !== tabSwitchSequence) return;
+        target = document.getElementById(tabName);
+      }
+    }
+    if (!target || sequence !== tabSwitchSequence) return;
+
+    const isTileTab = tabName.startsWith('tab-tiles-');
+    const tileTab = isTileTab
+      ? tabName.substring('tab-tiles-'.length)
+      : '';
+    let needsTileData = false;
+    if (isTileTab) {
+      // Keep the previous tab interactive until the requested editor has its
+      // complete grid. This prevents an index request or edit racing the
+      // initial full-grid response.
+      needsTileData = !tileDataLoadedTabs.has(tileTab);
+      if (needsTileData) {
+        try {
+          await fetchTileGridData(tileTab, false);
+        } catch (error) {
+          console.error('Tile grid load failed:', error);
+        }
+        if (sequence !== tabSwitchSequence) return;
+        if (!tileDataLoadedTabs.has(tileTab) || dragSource || resizeState) {
+          showNotification(t('networkError'), false);
+          return;
+        }
+      }
+      if (sequence !== tabSwitchSequence) return;
+      const freshTiles = getTilesData(tileTab);
+      if (sessionRestoredFolderTabs.has(tileTab)) {
+        freshTiles.forEach((tile, index) => {
+          renderTileFromData(tileTab, index, tile, sensorMetaCache);
+        });
+        layoutTiles(tileTab, freshTiles);
+        sessionRestoredFolderTabs.delete(tileTab);
+      } else if (needsTileData) {
+        syncTileGridStructure(tileTab, freshTiles);
+      }
+    }
+
+    const tabs = document.querySelectorAll('.tab-content');
+    tabs.forEach(tab => tab.classList.remove('active'));
+    target.classList.add('active');
+    setActiveTabButton(tabName);
+    try { localStorage.setItem('activeAdminTab', tabName); } catch (e) {}
+    updateTileSettingsMaxHeight();
+    if (isTileTab) {
+      const folderId = getFolderIdForTab(tileTab);
+      if (folderId > 0 && folderId !== SCREENSAVER_FOLDER_ID) {
+        touchFolderTabSessionCache(folderId);
+      }
+      if (tileTab === 'screensaver') {
+        initScreensaverEditor();
+      } else if (tileSelectionSeq === picks || currentTileTab !== tileTab) {
+        // The tab's own pick first (user 2026-10-22: an empty cell or a
+        // page field came back as the top left tile).
+        if (!restoreTabSelection(tileTab)) {
+          const rememberedIndex = getRememberedTileIndex(tileTab);
+          selectTile(rememberedIndex === null ? getTopLeftConfiguredTileIndex(tileTab) : rememberedIndex, tileTab);
+        }
+        window.requestAnimationFrame(restoreCurrentTileSelectionUi);
+      }
+      // Else something was picked here while its grid loaded (user
+      // 2026-10-22: the pick jumped to the top left tile): it stays.
+      // Let the browser paint the selected tab before cached/live values are
+      // reconciled. This also keeps a cache hit from extending click latency.
+      window.requestAnimationFrame(() => window.setTimeout(() => {
+        if (document.getElementById(tabName)?.classList.contains('active')) {
+          loadSensorValues(false, false, [tileTab]);
+        }
+      }, 0));
+    }
+    if (tabName === 'tab-network') runSettingsPageWork();
+  }
+
+  // The Tile settings panel takes the height of the tile editor row, which
+  // fills the card on wide windows (admin.css); narrow windows stack it below
+  // the grid. Only an inline cap from an earlier layout is cleared here.
+  function updateTileSettingsMaxHeight() {
+    document.querySelectorAll('.tile-settings').forEach(panel => { panel.style.maxHeight = ''; });
+  }
+  // Resize fires many times per second while a window is dragged, and the
+  // screensaver handler below re-renders the whole screensaver editor.
+  // Coalescing to one call per frame keeps that work off every single event.
+  function perFrame(callback) {
+    let frame = 0;
+    return () => {
+      if (frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        callback();
+      });
+    };
+  }
+
+  window.addEventListener('resize', perFrame(updateTileSettingsMaxHeight));
+
+  // Fills the server-rendered clock tiles (--:-- placeholders) with the current
+  // time and keeps them up to date. Clock tiles re-rendered by this script get
+  // their time, including the format, while rendering.
+  function fillStaticClockPreviews() {
+    if (typeof getClockPreviewTime !== 'function') return;
+    document.querySelectorAll('.tile-clock-time').forEach(el => {
+      if (el.dataset.autoClock === '1' || el.textContent.trim() === '--:--') {
+        el.dataset.autoClock = '1';
+        setClockDigits(el, getClockPreviewTime(0));
+      }
+    });
+    document.querySelectorAll('.tile-clock-date').forEach(el => {
+      if (el.dataset.autoClock === '1' || el.textContent.trim() === '--.--.----') {
+        el.dataset.autoClock = '1';
+        setClockDigits(el, getClockPreviewDate(0));
+      }
+    });
+    if (typeof fitCompactClockPreview === 'function') {
+      document.querySelectorAll('.tile.clock-compact').forEach(fitCompactClockPreview);
+    }
+    if (screensaverDraft) {
+      const time = document.getElementById('screensaverClockTime');
+      const date = document.getElementById('screensaverClockDate');
+      if (time) setClockDigits(time, getClockPreviewTime(screensaverDraft.time_format));
+      if (date) setClockDigits(date, getScreensaverClockPreviewDate(screensaverDraft));
+    }
+  }

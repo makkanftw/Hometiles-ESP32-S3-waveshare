@@ -1,0 +1,111 @@
+#pragma once
+
+#include <Arduino.h>
+#include <lvgl.h>
+
+#include "src/tiles/config/tile_icon_colors.h"
+
+struct Tile;
+
+// The rule layer of every tile ("Rules" in the Web Admin, the "src" line of
+// tile_icon_colors.h). A rule takes its color from the tile's own entity or
+// another entity:
+//   auto   the entity's own icon color as its tile shows it (light color,
+//          on/off, climate mode, cover state);
+//   rules  the color bar and state colors on the entity's state.
+// The color can force the icon color (over the type's state color) and tint
+// the tile background (tile_tint.h). Tile types that do not apply the fixed
+// icon color themselves (Switch, Climate, Cover, Media, Weather) get it
+// forced here as well. The Web Admin preview mirrors this in icon-colors.js.
+namespace tile_icon_source {
+
+// Latest cached payload of an entity (live MQTT cache, then the Bridge's
+// initial values). False when nothing is known.
+bool cached_payload(const String& entity, String& payload);
+
+// The rule color of a tile from the cached state of its rule entity; false
+// without an enabled rule, a known state or a result.
+// `fill`, when set, receives the matching state line's own "Fuellen";
+// `icon` the matching stop's or line's own icon.
+bool rule_color(const Tile& tile, uint32_t& rgb, tile_icon_colors::RowFill* fill = nullptr,
+                tile_icon_colors::Icon* icon = nullptr);
+
+// The entity whose state drives the tile's enabled rules (own or other), or
+// "" without enabled rules.
+String rule_entity(const Tile& tile);
+
+// Build time: the fixed icon color of tiles without their own state colors
+// (icon-and-title tiles, Clock, Text), else white.
+void apply_initial(lv_obj_t* icon, const Tile& tile);
+
+// The MDI icon label of a rendered card (through its disc), or nullptr for
+// image icons and tiles without an icon.
+lv_obj_t* card_icon(lv_obj_t* card);
+
+// Applies the rules to a rendered card: forced icon color, tile tint and the
+// discs that follow the background. Skips unchanged values.
+void refresh_card(lv_obj_t* card, const Tile& tile);
+
+// A new own color of a card (a tile entering or leaving the dark design):
+// kept behind a tint, else shown at once; refresh_card tints again.
+void set_card_base(lv_obj_t* card, uint32_t rgb);
+
+// A card with a rule (tile_surface::set_rule) changes its surface while it
+// runs: a tile without an own color in the light theme is filled while it is
+// tinted (tile_surface::kJewel). Its card color, rim and every role-colored
+// text and icon switch in place, without a rebuild; its open scopes draw the
+// rest of the running update with the new surface
+// (ui_theme::follow_surface). Without `tile` the card takes the default card
+// of the new surface.
+void change_surface(lv_obj_t* card, uint8_t surface, const Tile* tile = nullptr);
+
+// Every role-colored text and icon under `root` (a popup) moves from the
+// roles of surface `from` to those of `to` (ui_theme surfaces, -1 the theme).
+void recolor_surface(lv_obj_t* root, int8_t from, int8_t to);
+
+// The Media renderer reports the color of the cover a card shows (`known`
+// false without a cover or without a clear color, media/cover_color.h). A
+// card with "From cover" (icon color and/or tile color) follows it right
+// away; other cards only keep the value. Skips unchanged values.
+void set_cover_color(lv_obj_t* card, bool known, uint32_t rgb);
+// The cover color a card last reported, when it has a hue (a cover that tints).
+bool card_cover_color(lv_obj_t* card, uint32_t& rgb);
+
+// The control fill of a card's controls: pressed buttons
+// (tile_icon_disc::mark_control; Media previous and next, Climate - and +)
+// and resting surfaces (mark_surface; the Climate target pill) take the
+// circle's color (tone_color::fill: the icon hue with "Circle in icon
+// color", else neutral), opaque (a veil on see-through screensaver tiles).
+// Every icon color, tint and circle change reaches it through the discs; a
+// card press recolors the resting surfaces for the pressed card.
+void refresh_controls(lv_obj_t* card);
+
+// The background a popup inherits from its tile: the rules' tint when the
+// card (`obj` or up to three of its parents) is tinted, else `fallback`.
+// Every opener calls it, so it also remembers the opening tile: while that
+// popup is open it follows the tile's color (refresh_card). The popup header
+// disc takes the tile's circle options (popup_shell_use_tile_disc).
+uint32_t popup_background(lv_obj_t* obj, uint32_t fallback);
+
+// Openers of popups that keep the global tile color (Climate, Light and Cover
+// for now: following a light color while it is dragged restyled the popup on
+// every step) call this with their tile card, so no earlier opener makes them
+// follow a tile. Their header disc still takes the tile's circle options.
+void forget_popup_source(lv_obj_t* obj);
+
+// A popup no tile opened (Settings): forgets the last opener, so a color
+// change of that tile (a new cover, a tile reload) cannot recolor this popup,
+// and the header disc keeps its default.
+void open_popup_without_tile();
+
+// A tile filled from the start (tile_surface::kNeutralIdle) that got no tint
+// from its rules takes the idle grey before it is drawn.
+void settle_filled(lv_obj_t* card);
+
+// The circle and the shown icon of the tile that opened the popup for its
+// icon in `rgb`, computed exactly like the tile's own on the tile's surface
+// (tile_icon_disc::disc_fill; user 2026-10-10: the popup's circle and icon are
+// always the tile's). False without one.
+bool popup_tile_circle(uint32_t rgb, uint32_t& circle, uint8_t& opa, uint32_t& icon);
+
+}  // namespace tile_icon_source

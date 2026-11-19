@@ -1,0 +1,161 @@
+import assert from 'node:assert/strict';
+import {spawnSync} from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
+const sketch = fs.readFileSync(path.join(repoRoot, 'HomeTiles.ino'), 'utf8');
+const service = fs.readFileSync(
+  path.join(repoRoot, 'src/tiles/runtime/tile_update_service.h'), 'utf8');
+
+// The extraction must preserve the existing scheduling decisions in loop().
+const sleepStart = sketch.indexOf('if (powerManager.isInSleep())');
+const activeStart = sketch.indexOf('if (!camera_popup_busy && !PopupFirstFrame::any_pending())', sketch.indexOf('uint32_t t_popup_queues'));
+const activeEnd = sketch.indexOf('uint32_t t_update_queues', activeStart);
+assert.ok(sleepStart >= 0 && activeStart > sleepStart && activeEnd > activeStart);
+const sleep = sketch.slice(sleepStart, activeStart);
+const active = sketch.slice(activeStart, activeEnd);
+assert.match(sleep,
+  /mqtt_process_inbound_queue\(\);[\s\S]*process_tile_update_queues<TileUpdateBudget::DrainAll>\(\);[\s\S]*settings_update_power_status\(\);/,
+  'Sleep must drain live tile state after inbound MQTT and before status updates');
+assert.doesNotMatch(sleep, /process_tile_graph_queue\(\);/,
+  'Sleep must not start request/response graph processing');
+// Every loop, inside the camera gate: no idle two-second batch any more (a
+// moving Cover's steps arrive twice a second, user 2026-10-02). Graph tiles
+// ask for their day again after connecting (tile_graph_service_periodic).
+assert.match(active,
+  /if \(!camera_popup_busy && !PopupFirstFrame::any_pending\(\)\)\s*\{\s*if \(!hold_tile_updates\) process_tile_update_queues<TileUpdateBudget::Active>\(\);\s*process_tile_graph_queue\(\);\s*tile_graph_service_periodic\(\);\s*energy_service_periodic\(\);\s*\}/,
+  'Camera gating, graph order, and energy scheduling must stay in loop()');
+assert.doesNotMatch(sleep, /tile_graph_service_periodic\(\);/,
+  'Sleep must not ask for graph histories');
+assert.doesNotMatch(active, /isHighPerformance|last_queue_ms|>= 2000|process_idle_media_updates/,
+  'Tile updates must not wait for an idle batch');
+assert.doesNotMatch(service,
+  /process_tile_graph_queue|energy_service_periodic|millis\(|delay\(/,
+  'The shared service must not own scheduling or request/response work');
+assert.doesNotMatch(sleep, /process_idle_media_updates\(\);/,
+  'The sleep path retains its existing drain policy');
+
+const queueTypes = ['sensor', 'switch', 'climate', 'cover',
+  'binary_sensor', 'editable', 'device', 'calendar', 'weather', 'media'];
+const queueFunction = type => type === 'editable' ? 'process_editable_updates'
+  : type === 'device' ? 'process_device_updates'
+  : type === 'calendar' ? 'process_calendar_updates' : `process_${type}_update_queue`;
+const declarations = queueTypes.map(type =>
+  `void ${queueFunction(type)}(uint8_t max_updates = 0);`).join('\n');
+const endpoints = queueTypes.map((type, index) =>
+  `void ${queueFunction(type)}(uint8_t budget) { consume(${index}, budget); }`
+).join('\n');
+
+// Compile the production header. Only the queue endpoints are replaced so the
+// harness can verify ordering, bounded backlogs, and full sleep drains on a host.
+const source = `
+#include <array>
+#include <cassert>
+#include <cstddef>
+#include "src/tiles/runtime/tile_update_service.h"
+
+// Icon-and-title recolors run last and are bounded by the pending mask.
+static unsigned icon_source_calls = 0;
+void process_icon_source_updates() { ++icon_source_calls; }
+// Power flow tiles redraw each marked tile once per pass, in every budget.
+static unsigned power_flow_calls = 0;
+void process_power_flow_updates() { ++power_flow_calls; }
+bool power_flow_entity_changed(const char*) { return false; }
+
+struct Call { std::size_t queue; uint8_t budget; };
+static std::array<unsigned, 10> pending{};
+static std::array<Call, 10> calls{};
+static std::size_t call_count = 0;
+
+static void consume(std::size_t queue, uint8_t budget) {
+  assert(call_count < calls.size());
+  calls[call_count++] = {queue, budget};
+  unsigned count = pending[queue];
+  if (budget != 0 && count > budget) count = budget;
+  pending[queue] -= count;
+}
+
+${endpoints}
+
+static void expect_calls(const std::array<uint8_t, 10>& budgets) {
+  assert(call_count == calls.size());
+  for (std::size_t i = 0; i < calls.size(); ++i) {
+    assert(calls[i].queue == i);
+    assert(calls[i].budget == budgets[i]);
+  }
+  call_count = 0;
+}
+
+int main() {
+  constexpr std::array<uint8_t, 10> active = {6, 6, 4, 4, 4, 4, 4, 2, 4, 2};
+  constexpr std::array<uint8_t, 10> drain_all = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  pending.fill(20);
+
+  process_tile_update_queues<TileUpdateBudget::Active>();
+  expect_calls(active);
+  for (std::size_t i = 0; i < pending.size(); ++i) {
+    assert(pending[i] == 20 - active[i]);
+  }
+
+  process_tile_update_queues<TileUpdateBudget::Active>();
+  expect_calls(active);
+  for (std::size_t i = 0; i < pending.size(); ++i) {
+    assert(pending[i] == 20 - 2 * active[i]);
+  }
+
+  process_tile_update_queues<TileUpdateBudget::DrainAll>();
+  expect_calls(drain_all);
+  for (unsigned count : pending) assert(count == 0);
+
+  // Empty queues still receive service, including Media cover housekeeping.
+  process_tile_update_queues<TileUpdateBudget::Active>();
+  expect_calls(active);
+  for (unsigned count : pending) assert(count == 0);
+  return 0;
+}
+`;
+
+const compiler = [process.env.CXX, 'clang++', 'g++', 'c++']
+  .filter(Boolean)
+  .find(candidate => {
+    const result = spawnSync(candidate, ['--version'], {encoding: 'utf8'});
+    return !result.error && result.status === 0;
+  });
+if (!compiler) {
+  console.log('SKIP: tile update service runtime test requires a C++ compiler');
+  process.exit(0);
+}
+
+const buildRoot = path.join(repoRoot, 'build', 'tests');
+fs.mkdirSync(buildRoot, {recursive: true});
+const tempRoot = fs.mkdtempSync(path.join(buildRoot, 'tile-update-service-'));
+try {
+  fs.mkdirSync(path.join(tempRoot, 'src/types/value'), {recursive:true});
+  fs.writeFileSync(path.join(tempRoot, 'src/types/value/value_control.h'), '#pragma once\nvoid process_editable_updates(uint8_t);\n');
+  fs.mkdirSync(path.join(tempRoot, 'src/types/device'), {recursive:true});
+  fs.writeFileSync(path.join(tempRoot, 'src/types/device/device_updates.h'), '#pragma once\n#include <stdint.h>\nvoid process_device_updates(uint8_t);\n');
+  fs.mkdirSync(path.join(tempRoot, 'src/types/calendar'), {recursive:true});
+  fs.writeFileSync(path.join(tempRoot, 'src/types/calendar/calendar_updates.h'), '#pragma once\n#include <stdint.h>\nvoid process_calendar_updates(uint8_t);\n');
+  const stubDir = path.join(tempRoot, 'src', 'tiles', 'runtime');
+  fs.mkdirSync(stubDir, {recursive: true});
+  fs.writeFileSync(path.join(stubDir, 'tile_renderer.h'),
+    `#pragma once\n#include <stdint.h>\n${declarations}\n`);
+  const sourcePath = path.join(tempRoot, 'test.cpp');
+  const outputPath = path.join(tempRoot,
+    process.platform === 'win32' ? 'test.exe' : 'test');
+  fs.writeFileSync(sourcePath, source);
+  const compile = spawnSync(compiler,
+    ['-std=c++17', '-Wall', '-Wextra', '-Werror', '-I', tempRoot,
+      '-I', repoRoot, sourcePath, '-o', outputPath], {encoding: 'utf8'});
+  assert.equal(compile.status, 0,
+    `Tile update service harness did not compile:\n${compile.stdout}${compile.stderr}`);
+  const run = spawnSync(outputPath, [], {encoding: 'utf8'});
+  assert.equal(run.status, 0,
+    `Tile update service runtime contract failed:\n${run.stdout}${run.stderr}`);
+  console.log('Tile update service ordering, budgets, and loop integration passed');
+} finally {
+  assert.ok(path.resolve(tempRoot).startsWith(path.resolve(buildRoot) + path.sep));
+  fs.rmSync(tempRoot, {recursive: true, force: true});
+}
